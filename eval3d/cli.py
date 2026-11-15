@@ -31,32 +31,39 @@ def _absolute_template(path: str) -> str:
 def _refuse_variant(config, command: str) -> None:
     if config.is_variant:
         raise click.ClickException(
-            f"{command} is not available in variant mode (variant {config.variant}): it would write "
-            "the default tree or untagged outputs"
+            f"{command} is not available with a custom view set (--views, variant {config.variant}): it would "
+            "write the default tree or untagged outputs"
         )
+
+
+_VIEWS_HELP = ("Sparse-view evaluation: SfMData file of a custom view set (silhouettes in <its dir>/masks/, by view "
+               "name). After the usual cleanup, the reconstruction and the GT point cloud are filtered a second time "
+               "by visibility in these views. Outputs: results_cleaned@<tag>/, Groundtruth@<tag>/, "
+               "eval_results@<tag>/.")
+_VARIANT_HELP = "Tag of the --views outputs (default: the file name of --views without its extension)."
+
+
+def _apply_views(config, views, variant) -> None:
+    if views is None:
+        if variant is not None:
+            raise click.UsageError("--variant needs --views")
+        return
+    try:
+        config.apply_views(_absolute_template(views), variant)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
 
 
 @click.group()
 @click.option("--config", "-c", type=click.Path(exists=True), required=True, help="Path to config YAML file")
-@click.option("--eval-cameras", "eval_cameras", default=None,
-              help="Evaluation variant: camera file (SfMData) overriding the evaluation cameras for the two "
-                   "visibility cleanings (reconstruction cleanup, GT restriction). Masks: <its dir>/masks/, "
-                   "watertight masks: <its dir>/masks_watertight/ if present. Requires --variant.")
-@click.option("--variant", "variant", default=None,
-              help="Evaluation variant tag: outputs go to results_cleaned@<tag>/, eval_results@<tag>/, "
-                   "Groundtruth@<tag>/. Requires --eval-cameras.")
+@click.option("--views", "views", default=None, help=_VIEWS_HELP + " Also an option of `run`.")
+@click.option("--variant", "variant", default=None, help=_VARIANT_HELP)
 @click.pass_context
-def main(ctx, config, eval_cameras, variant):
+def main(ctx, config, views, variant):
     """Evaluation pipeline for 3D reconstruction benchmarks."""
     ctx.ensure_object(dict)
-    if (eval_cameras is None) != (variant is None):
-        raise click.UsageError("--eval-cameras and --variant go together")
     cfg = load_config(config)
-    if variant is not None:
-        try:
-            cfg.apply_variant(variant, _absolute_template(eval_cameras))
-        except ValueError as e:
-            raise click.UsageError(str(e)) from e
+    _apply_views(cfg, views, variant)
     cfg._config_path = Path(config)
     ctx.obj["config"] = cfg
     ctx.obj["config_path"] = config
@@ -77,14 +84,14 @@ def preprocess_gt(ctx, object_name, curvature, curvature_radius, curvature_tube,
                   use_masks, clean_gt, force):
     """Preprocess ground truth: clean mesh, sample point cloud and compute attributes.
 
-    In variant mode: only derives Groundtruth@<tag>, the base kit restricted to the points seen by the
-    variant's cameras (--force rebuilds it).
+    With a custom view set (--views): only derives Groundtruth@<tag>, the base kit filtered by
+    visibility in these views (--force rebuilds it).
     """
     from .pipeline.preprocess_gt import preprocess_gt as _preprocess_gt
 
     config = ctx.obj["config"]
     if config.is_variant:
-        click.echo(f"Variant {config.variant}: deriving Groundtruth@{config.variant} from the base kit")
+        click.echo(f"Custom view set {config.variant}: deriving Groundtruth@{config.variant} from the base kit")
     if use_masks is not None:
         config.cleanup.use_masks = use_masks
     if curvature_radius is not None:
@@ -201,13 +208,26 @@ def evaluate(ctx, object_name, method_name, force):
 @click.option("--workers", "-w", type=int, help="Max parallel workers")
 @click.option("--slurm", is_flag=True, help="Use SLURM instead of local execution")
 @click.option("--stages", multiple=True, default=["cleanup", "evaluate"], help="Stages to run")
+@click.option("--views", "views", default=None, help=_VIEWS_HELP)
+@click.option("--variant", "variant", default=None, help=_VARIANT_HELP)
 @click.pass_context
-def run(ctx, object_name, method_name, workers, slurm, stages):
-    """Run the full pipeline (cleanup + evaluate) for all objects/methods, or the ones given."""
+def run(ctx, object_name, method_name, workers, slurm, stages, views, variant):
+    """Run the full pipeline (cleanup + evaluate) for all objects/methods, or the ones given.
+
+    With --views: the usual cleanup (reused when it exists), a second cleaning step of the
+    reconstruction and of the GT point cloud on the custom views, then the evaluation of the two.
+    """
     config = ctx.obj["config"]
     config_path = ctx.obj["config_path"]
+    _apply_views(config, views, variant)
 
     stages = list(stages)
+
+    if config.is_variant and "evaluate" in stages:
+        # The GT of the custom views, once per object, before the per-method jobs.
+        from .pipeline.variant_gt import derive_variant_gt
+        for obj in [object_name] if object_name else config.dataset.objects:
+            derive_variant_gt(config, obj)
 
     if slurm:
         from .runner.slurm import SlurmRunner
@@ -284,7 +304,7 @@ def watch(ctx, dry_run, scan_mode, state_file):
         state_path=state_path,
         dry_run=dry_run,
         scan_mode=scan_mode,
-        variant=(config.variant, config.paths.eval_cameras_override) if config.is_variant else None,
+        variant=(config.variant, config.paths.views) if config.is_variant else None,
     )
 
     if dry_run:

@@ -54,28 +54,59 @@ cloud came from, the sampling density and the resulting count.
 - `apply-masks`, `preprocess-challenges`: build and apply the optional
   per-point challenge masks described in [configuration](configuration.md#masks).
 
-## Evaluation variants: a custom camera set
+## Sparse-view evaluation
 
-To score a reconstruction only on the surface seen by a subset of views (e.g. a sparse-view
-reconstruction from 3 or 6 input views), give the two visibility cleanings another camera file:
+A reconstruction made from a few views (3, 6, n) is scored on the surface these views see. Give
+`run` the SfMData file of the views that were used:
 
 ```bash
-V="--eval-cameras presets/front3/cameras.sfm --variant front3"
-eval-pipeline -c cfg.yaml $V preprocess-gt -o rock      # Groundtruth@front3/
-eval-pipeline -c cfg.yaml $V run -o rock -m my_method   # results_cleaned@front3/, eval_results@front3/
+eval-pipeline -c cfg.yaml run -o rock -m my_method                               # usual evaluation
+eval-pipeline -c cfg.yaml run -o rock -m my_method --views sparse/front3.sfm     # sparse-view evaluation
 ```
 
-The two options go together (or `paths.eval_cameras_override` and `variant` in the config).
-The custom file is an SfMData file; its masks are read from `<its dir>/masks/` by view name, its
-watertight masks from `<its dir>/masks_watertight/` (by view name too) when that directory
-exists, otherwise there is no watertight culling.
+Without `--views`, nothing changes. With `--views`, the cleaning is done in two steps:
 
-- `cleanup` carves the reconstruction with the custom views (`results_raw/` is shared).
-- `preprocess-gt` only derives `Groundtruth@<tag>/`: the base kit's `gt_pcd.npy` restricted to
-  the points kept by the same rule as `cleanup` on the custom views (`filter_by_visibility`: same
-  masks and dilation, silhouette carving, then seen unoccluded by at least one view), with every per-point array of `attributes/` and `challenges/` subset by the same
-  mask, `keep.npy` (indices into the base cloud) and `variant_provenance.json`. Nothing is
-  resampled: the attributes, including `visibility_count`, keep their values on the default set.
-- `evaluate`, `apply-masks`, `curves`, `recompute`, `visualize` and `watch` read and write the
-  tagged directories; the default tree is never written. `aggregate`, `latex`, `figures`,
-  `proxy-curvature` and `preprocess-challenges` refuse variant mode.
+1. **Usual cleanup**, as without `--views`: all the evaluation views, their silhouettes and, for
+   the objects that have them, the watertight masks. Output: `results_cleaned/` (reused when it
+   exists).
+2. **Second cleanup of the reconstruction** on the custom views: the same visibility filter
+   (`filter_by_visibility`, same dilation) applied to the mesh of step 1 with the cameras and
+   silhouettes of the custom file. Output: `results_cleaned@<tag>/` (`views_provenance.json`
+   records the file and the settings).
+3. **Same second cleanup of the GT point cloud**: the same call on the published `gt_pcd.npy`
+   (occluder: the GT mesh). Output: `Groundtruth@<tag>/`, with every per-point array of
+   `attributes/` and `challenges/` subset by the same mask, `keep.npy` (indices into the published
+   cloud) and `variant_provenance.json`. Nothing is resampled: the attributes, including
+   `visibility_count`, keep their values on the full view set.
+4. **Evaluation** of `results_cleaned@<tag>/` against `Groundtruth@<tag>/`. Output:
+   `eval_results@<tag>/`.
+
+**The custom file.** An SfMData file (`.sfm` or `.json`) in the frame of the evaluation cameras,
+with one view per camera. The silhouette of a view is `<dir of the file>/masks/<stem>.png`, where
+`<stem>` is the file name of the view's `path` without its extension; a view without its silhouette
+is an error.
+
+**The tag** is the file name without its extension (`front3.sfm` gives `@front3`); `--variant <tag>`
+sets another one. One tag per view set: an existing `@<tag>` output made from another file or other
+settings is refused, `--force` (on `cleanup` and `preprocess-gt`) rebuilds it.
+
+**Watertight masks are applied at step 1 only.** They mark the holes of the GT (e.g. the inside of
+a shoe) and only remove vertices of the reconstruction. Step 1 has removed them, so the custom view
+set needs no watertight masks, and the GT, which has no surface there, is not concerned.
+
+**The GT has no step 1**: the published `gt_pcd.npy` is already cleaned with all the evaluation
+views. Control: a custom file holding all the evaluation views gives the result of the usual
+evaluation, for the reconstruction and for the GT.
+
+`--views` (and `--variant`) are also global options, for the commands run one by one:
+
+```bash
+V="--views sparse/front3.sfm"
+eval-pipeline -c cfg.yaml $V preprocess-gt -o rock           # step 3
+eval-pipeline -c cfg.yaml $V cleanup -o rock -m my_method    # steps 1 and 2
+eval-pipeline -c cfg.yaml $V evaluate -o rock -m my_method   # step 4
+```
+
+`apply-masks`, `curves`, `recompute`, `visualize` and `watch` then read and write the tagged
+directories. `aggregate`, `latex`, `figures`, `proxy-curvature` and `preprocess-challenges` refuse
+`--views`. The config keys are `paths.views` and `variant`.

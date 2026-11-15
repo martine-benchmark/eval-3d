@@ -60,11 +60,11 @@ class PathsConfig(BaseModel):
         default=None,
         description="Optional watertight-issue mask directory; culling is enabled automatically when PNG masks exist.",
     )
-    eval_cameras_override: Optional[str] = Field(
+    views: Optional[str] = Field(
         default=None,
-        description="Evaluation variant (with `variant`): camera file template overriding the evaluation cameras for "
-        "the two visibility cleanings only (reconstruction cleanup, GT restriction). Its masks are read from "
-        "<dir of the file>/masks/, its watertight masks from <dir>/masks_watertight/ when present.",
+        description="Sparse-view evaluation: SfMData file template of a custom view set (CLI --views). After the "
+        "usual cleanup, the reconstruction and the GT point cloud are filtered a second time by visibility in these "
+        "views. Their silhouettes are read from <dir of the file>/masks/ by view name.",
     )
     output_root: Optional[Path] = Field(default=None, description="Output directory for generated scripts and aggregated results")
 
@@ -236,21 +236,32 @@ class Config(BaseModel):
     visualization: VisualizationConfig = Field(default_factory=VisualizationConfig)
     variant: Optional[str] = Field(
         default=None,
-        description="Evaluation variant tag (with paths.eval_cameras_override). Outputs go to "
-        "results_cleaned@<tag>/, eval_results@<tag>/ and Groundtruth@<tag>/; the default tree is only read.",
+        description="Tag of a sparse-view evaluation (with paths.views; default: the file name of paths.views "
+        "without its extension). Outputs go to results_cleaned@<tag>/, eval_results@<tag>/ and Groundtruth@<tag>/.",
     )
 
     @model_validator(mode="after")
     def validate_variant(self) -> "Config":
-        _check_variant(self.variant, self.paths.eval_cameras_override)
+        self.variant = _variant_tag(self.variant, self.paths.views)
         return self
 
-    def apply_variant(self, tag: str, eval_cameras: str) -> "Config":
-        """Switch this config to an evaluation variant (CLI --variant / --eval-cameras)."""
-        _check_variant(tag, eval_cameras)
+    def apply_views(self, views: str, tag: Optional[str] = None) -> "Config":
+        """Switch this config to a sparse-view evaluation (CLI --views, --variant)."""
+        tag = _variant_tag(tag, views)
         self.variant = tag
-        self.paths.eval_cameras_override = str(eval_cameras)
+        self.paths.views = str(views)
         return self
+
+    def default_view(self) -> "Config":
+        """This config without the custom view set: the usual evaluation (first cleaning step)."""
+        if not self.is_variant:
+            return self
+        base = self.model_copy(deep=True)
+        base.variant = None
+        base.paths.views = None
+        if hasattr(self, "_config_path"):
+            base._config_path = self._config_path
+        return base
 
     @property
     def is_variant(self) -> bool:
@@ -261,10 +272,10 @@ class Config(BaseModel):
         return f"{name}@{self.variant}" if self.is_variant else name
 
     def variant_cli_args(self) -> str:
-        """Global CLI options reproducing the variant in a sub-job ('' in the default mode)."""
+        """Global CLI options reproducing the custom view set in a sub-job ('' in the default mode)."""
         if not self.is_variant:
             return ""
-        return f"--eval-cameras {shlex.quote(self.paths.eval_cameras_override)} --variant {self.variant}"
+        return f"--views {shlex.quote(self.paths.views)} --variant {self.variant}"
 
     def _resolve_template(self, template: str, object_name: str, method_name: str = None) -> Path:
         """Resolve path template with placeholders.
@@ -355,15 +366,15 @@ class Config(BaseModel):
         return self.get_base_gt_artifacts_dir(object_name)
 
     def get_base_gt_artifacts_dir(self, object_name: str) -> Path:
-        """GT artefacts of the default evaluation (the source of a variant's derived kit)."""
+        """GT artefacts of the default evaluation (the source of a custom view set's derived kit)."""
         if self.paths.gt_artifacts_root:
             return self._resolve_template(self.paths.gt_artifacts_root, object_name)
         return self.get_gt_dir(object_name)
 
     def get_variant_gt_dir(self, object_name: str) -> Path:
-        """Derived GT kit of the variant: the base kit restricted to the points seen by its cameras."""
+        """Derived GT kit of the custom view set: the base kit filtered by visibility in its views."""
         if not self.is_variant:
-            raise ValueError("get_variant_gt_dir needs an evaluation variant (--variant / --eval-cameras)")
+            raise ValueError("get_variant_gt_dir needs a custom view set (--views)")
         return self.get_eval_root(object_name) / f"Groundtruth@{self.variant}"
 
     def get_gt_derived_dir(self, object_name: str) -> Path:
@@ -469,31 +480,18 @@ class Config(BaseModel):
             return masks_dir
         return self.get_data_root(object_name, method_name) / "mask"
 
-    def get_cleaning_cameras_path(self, object_name: str, method_name: str = None) -> Path:
-        """Cameras of the two visibility cleanings (reconstruction cleanup, GT restriction).
+    def get_views_path(self, object_name: str, method_name: str = None) -> Path:
+        """SfMData file of the custom view set (second cleaning step of the reconstruction and of the GT).
 
-        The variant's override in variant mode, the evaluation cameras otherwise.
         visibility_count, challenges and visualize keep get_cameras_path.
         """
-        if self.is_variant:
-            return self._resolve_template(self.paths.eval_cameras_override, object_name, method_name)
-        return self.get_cameras_path(object_name, method_name)
+        if not self.is_variant:
+            raise ValueError("get_views_path needs a custom view set (--views)")
+        return self._resolve_template(self.paths.views, object_name, method_name)
 
-    def get_cleaning_masks_dir(self, object_name: str, method_name: str = None) -> Path:
-        """Masks of the cleaning cameras: <dir of the override>/masks/ in variant mode."""
-        if self.is_variant:
-            return self.get_cleaning_cameras_path(object_name, method_name).parent / "masks"
-        return self.get_masks_dir(object_name, method_name)
-
-    def get_cleaning_watertight_dir(self, object_name: str) -> Path:
-        """Watertight masks of the cleaning cameras.
-
-        Variant mode: <dir of the override>/masks_watertight/ only (absent = no watertight culling;
-        the default set's masks belong to other views and are never used).
-        """
-        if self.is_variant:
-            return self.get_cleaning_cameras_path(object_name).parent / "masks_watertight"
-        return self.get_watertight_masks_dir(object_name)
+    def get_views_masks_dir(self, object_name: str, method_name: str = None) -> Path:
+        """Silhouettes of the custom view set: <dir of the file>/masks/."""
+        return self.get_views_path(object_name, method_name).parent / "masks"
 
     def get_lock_path(self, object_name: str, method_name: str, stage: str) -> Path:
         """Failure lock of a stage (cleanup, eval, viz) for a method."""
@@ -538,12 +536,18 @@ class Config(BaseModel):
 _VARIANT_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
-def _check_variant(tag: Optional[str], eval_cameras: Optional[str]) -> None:
-    if (tag is None) != (eval_cameras is None):
-        raise ValueError("an evaluation variant needs both the tag (variant / --variant) and the camera file "
-                         "(paths.eval_cameras_override / --eval-cameras), together")
-    if tag is not None and not _VARIANT_TAG.fullmatch(tag):
-        raise ValueError(f"variant tag {tag!r}: letters, digits, '.', '_' and '-' only (it names directories)")
+def _variant_tag(tag: Optional[str], views: Optional[str]) -> Optional[str]:
+    """Tag of a custom view set: `tag` if given, else the file name of `views` without its extension."""
+    if views is None:
+        if tag is not None:
+            raise ValueError("a variant tag (variant / --variant) needs a custom view set (paths.views / --views)")
+        return None
+    if tag is None:
+        tag = Path(str(views)).stem
+    if not _VARIANT_TAG.fullmatch(tag):
+        raise ValueError(f"variant tag {tag!r}: letters, digits, '.', '_' and '-' only (it names directories); "
+                         "give one with variant / --variant")
+    return tag
 
 
 def load_config(config_path: str | Path) -> Config:

@@ -216,12 +216,10 @@ def compute_visibility_count(
     mesh: trimesh.Trimesh,
     cameras: dict,
     masks_dir: str | Path,
-    dilation_radius: int | str = 0,
+    dilation_radius: int = 0,
     show_progress: bool = True,
     use_masks: bool = True,
     ray_chunk: int = 2_000_000,
-    dilation_ref_px: int = AUTO_DILATION_REF_PX,
-    dilation_ref_n_pixels: int = AUTO_DILATION_REF_N_PIXELS,
 ) -> np.ndarray:
     """Compute per-point visibility count across all cameras.
 
@@ -234,12 +232,9 @@ def compute_visibility_count(
         mesh: Mesh for occlusion testing.
         cameras: Camera dict with 'P', 'Rt' arrays.
         masks_dir: Directory containing mask images (000.png, 001.png, ...).
-        dilation_radius: Mask dilation radius in pixels, or "auto" (per mask, from its resolution, as
-            in filter_by_visibility: see compute_auto_dilation).
+        dilation_radius: Mask dilation radius in pixels.
         show_progress: Show progress bar.
         use_masks: Whether to use 2D masks for filtering.
-        dilation_ref_px: Auto-dilation reference radius (pixels at the reference resolution).
-        dilation_ref_n_pixels: Auto-dilation reference resolution (total pixels).
         ray_chunk: Rays cast per call. Only points inside the view are ray-cast
             (the count is in_view AND not occluded), in chunks: same result as
             casting every point at once, with bounded memory (the all-points cast
@@ -282,10 +277,7 @@ def compute_visibility_count(
         camera_center = camera_centers[view_idx]
 
         if use_masks:
-            radius = dilation_radius
-            if isinstance(radius, str) and radius == "auto":
-                radius = compute_auto_dilation(mask.size, dilation_ref_px, dilation_ref_n_pixels)
-            _, in_view = check_points_in_mask(points, P, mask, radius, pixel_centre)
+            _, in_view = check_points_in_mask(points, P, mask, dilation_radius, pixel_centre)
         else:
             in_view = check_points_in_bounds(points, P, mask.shape, pixel_centre)
 
@@ -501,7 +493,6 @@ def filter_by_issue_watertight(
     sample_count: int = 100,
     orientation_ratio_threshold: float = 0.7,
     show_progress: bool = True,
-    mask_paths: list[Path] | None = None,
 ) -> np.ndarray:
     """Count, per vertex, how many watertight-issue masks flag it (Robin's culling).
 
@@ -529,8 +520,6 @@ def filter_by_issue_watertight(
         orientation_ratio_threshold: (kept for signature parity / logging; the flip
             decision itself defers to estimate_normal_flip).
         show_progress: Print progress.
-        mask_paths: Issue mask of each view, in the order of ``cameras["P"]`` (overrides the glob
-            order of ``masks_issue_watertight_dir``; used for a custom camera set, paired by view name).
 
     Returns:
         issue_counts: (N,) int32, number of views flagging each vertex.
@@ -590,10 +579,7 @@ def filter_by_issue_watertight(
         if flip:
             oriented_normals = -normals
 
-    if mask_paths is not None:
-        issue_mask_paths = [Path(p) for p in mask_paths]
-    else:
-        issue_mask_paths = sorted(Path(masks_issue_watertight_dir).glob("*.png"))
+    issue_mask_paths = sorted(Path(masks_issue_watertight_dir).glob("*.png"))
     if not issue_mask_paths:
         issue_mask_paths = sorted(Path(masks_issue_watertight_dir).glob("*.npy"))
     if not issue_mask_paths:

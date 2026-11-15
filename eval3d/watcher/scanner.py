@@ -644,14 +644,14 @@ def run_watcher(
         state_path: Path to state JSON file (default: beside config).
         dry_run: If True, don't actually submit jobs.
         scan_mode: "auto" scans all directories, "config" uses methods from config.
-        variant: (tag, camera file template) of an evaluation variant set on the command line.
+        variant: (tag, view file template) of a custom view set given on the command line (--views).
 
     Returns:
         Number of jobs submitted.
     """
     config = load_config(config_path)
     if variant is not None:
-        config.apply_variant(*variant)
+        config.apply_views(variant[1], variant[0])
 
     if state_path is None:
         state_path = default_state_path(config_path, config)

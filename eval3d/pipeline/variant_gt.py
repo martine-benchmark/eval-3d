@@ -1,10 +1,11 @@
-"""GT kit of an evaluation variant: the base kit restricted to the points seen by the custom cameras.
+"""GT kit of a sparse-view evaluation: the base kit filtered by visibility in the custom views.
 
-Nothing is resampled or recomputed. The base `gt_pcd.npy` is filtered by the views of the override
-(`paths.eval_cameras_override` / `--eval-cameras`) with the same rule as the reconstruction cleanup
-and the GT cleaning, `filter_by_visibility`: same masks, same dilation; a point inside a view's image
-but outside its dilated mask is removed (silhouette carving), the others are kept if at least one
-view sees them unoccluded (ray casting on the GT mesh).
+Nothing is resampled or recomputed. The base `gt_pcd.npy` (the published one, already cleaned with
+all the evaluation views) is filtered by the views of the custom set (`paths.views` / `--views`)
+with the same call as the second cleaning step of the reconstruction, `filter_by_visibility`: same
+silhouettes, same dilation, no watertight masks; a point inside a view's image but outside its
+dilated mask is removed (silhouette carving), the others are kept if at least one view sees them
+unoccluded (ray casting on the GT mesh).
 Every per-point array of the kit (`gt_pcd.npy`, `attributes/*.npy`, `challenges/*.npy`, exclusion
 masks included) is indexed by the same keep mask, so the attributes stay aligned; the other files of
 the kit's scoring subtrees are copied. The result is written to `Groundtruth@<tag>/` with `keep.npy`
@@ -46,12 +47,26 @@ def require_view_masks(cameras: dict, masks_dir: Path) -> list[Path]:
     return paths
 
 
-def _md5(path: Path) -> str:
+def md5_file(path: Path) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def visibility_settings(config, views_path: Path) -> dict:
+    """What a second cleaning step depends on: the view file and the visibility settings."""
+    c = config.cleanup
+    return {
+        "views": str(views_path),
+        "views_md5": md5_file(views_path),
+        "rule": "filter_by_visibility",
+        "use_masks": bool(c.use_masks),
+        "dilation_radius": c.dilation_radius if isinstance(c.dilation_radius, str) else int(c.dilation_radius),
+        "dilation_ref_px": int(c.dilation_ref_px),
+        "dilation_ref_n_pixels": int(c.dilation_ref_n_pixels),
+    }
 
 
 def _kit_layout(base: Path, n_base: int) -> tuple[list[str], list[str], list[str]]:
@@ -132,44 +147,35 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
     from ..core.visibility import filter_by_visibility
 
     if not config.is_variant:
-        raise ValueError("derive_variant_gt needs an evaluation variant (--variant / --eval-cameras)")
+        raise ValueError("derive_variant_gt needs a custom view set (--views)")
 
     base = config.get_base_gt_artifacts_dir(object_name)
     out = config.get_variant_gt_dir(object_name)
-    cameras_path = config.get_cleaning_cameras_path(object_name)
-    masks_dir = config.get_cleaning_masks_dir(object_name)
+    cameras_path = config.get_views_path(object_name)
+    masks_dir = config.get_views_masks_dir(object_name)
     c = config.cleanup
 
     if out.resolve() == base.resolve():
         raise ValueError(f"the derived kit would overwrite its base: {out}")
     if not cameras_path.exists():
-        raise FileNotFoundError(f"Variant cameras not found: {cameras_path}")
+        raise FileNotFoundError(f"Custom view set not found: {cameras_path}")
     if not (base / "gt_pcd.npy").exists():
         raise FileNotFoundError(f"GT point cloud not found: {base / 'gt_pcd.npy'}")
 
-    settings = {
-        "eval_cameras": str(cameras_path),
-        "eval_cameras_md5": _md5(cameras_path),
-        "base_gt_dir": str(base),
-        "rule": "filter_by_visibility",
-        "use_masks": bool(c.use_masks),
-        "dilation_radius": c.dilation_radius if isinstance(c.dilation_radius, str) else int(c.dilation_radius),
-        "dilation_ref_px": int(c.dilation_ref_px),
-        "dilation_ref_n_pixels": int(c.dilation_ref_n_pixels),
-    }
+    settings = {**visibility_settings(config, cameras_path), "base_gt_dir": str(base)}
 
     prov_path = out / PROVENANCE_FILE
     if prov_path.exists() and not force:
         previous = json.loads(prov_path.read_text())
         changed = [k for k, v in settings.items() if previous.get(k) != v]
         if not changed:
-            print(f"  Variant GT exists, skipping: {out}")
+            print(f"  Sparse-view GT exists, skipping: {out}")
             return out
         raise ValueError(
             f"{out} was derived with other settings ({', '.join(changed)}); pass --force to rebuild it"
         )
 
-    print(f"Variant GT for {object_name} (variant {config.variant}): {cameras_path}")
+    print(f"Sparse-view GT for {object_name} ({config.variant}): {cameras_path}")
     gt_pcd = np.load(base / "gt_pcd.npy")
     n_base = len(gt_pcd)
     per_point, copied, skipped = _kit_layout(base, n_base)
@@ -182,7 +188,7 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
     mesh, mesh_paths = _occluder(config, object_name)
     print(f"  Occluder: {len(mesh.vertices):,} vertices, {len(mesh.faces):,} faces")
 
-    # Same call as cleanup_mesh, on the GT points.
+    # Same call as the second cleaning step of the reconstruction, on the GT points.
     keep = filter_by_visibility(
         gt_pcd, mesh, cameras, masks_dir,
         dilation_radius=c.dilation_radius,
@@ -219,7 +225,7 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
         prov = {
             "variant": config.variant,
             **settings,
-            "views": views,
+            "views_list": views,
             "n_views": len(views),
             "masks_dir": str(masks_dir),
             "dilation_px_per_view": _dilation_per_view(config, mask_paths),
