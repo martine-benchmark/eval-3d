@@ -140,6 +140,8 @@ def preprocess_challenges(
         object_name: Object name.
         force: Overwrite existing masks.
     """
+    if config.is_variant:
+        raise ValueError("preprocess-challenges builds the default kit; a variant subsets it (preprocess-gt)")
     gt_dir = config.get_gt_dir(object_name)              # writable workspace
     raw_dir = config.get_challenges_raw_dir(object_name)  # read-only source (gt_root)
     out_dir = gt_dir / "challenges"

@@ -53,3 +53,29 @@ cloud came from, the sampling density and the resulting count.
   the visualization extra in [install](../README.md#install)).
 - `apply-masks`, `preprocess-challenges`: build and apply the optional
   per-point challenge masks described in [configuration](configuration.md#masks).
+
+## Evaluation variants: a custom camera set
+
+To score a reconstruction only on the surface seen by a subset of views (e.g. a sparse-view
+reconstruction from 3 or 6 input views), give the two visibility cleanings another camera file:
+
+```bash
+V="--eval-cameras presets/front3/cameras.sfm --variant front3"
+eval-pipeline -c cfg.yaml $V preprocess-gt -o rock      # Groundtruth@front3/
+eval-pipeline -c cfg.yaml $V run -o rock -m my_method   # results_cleaned@front3/, eval_results@front3/
+```
+
+The two options go together (or `paths.eval_cameras_override` and `variant` in the config).
+The custom file is an SfMData file; its masks are read from `<its dir>/masks/` by view name, its
+watertight masks from `<its dir>/masks_watertight/` (by view name too) when that directory
+exists, otherwise there is no watertight culling.
+
+- `cleanup` carves the reconstruction with the custom views (`results_raw/` is shared).
+- `preprocess-gt` only derives `Groundtruth@<tag>/`: the base kit's `gt_pcd.npy` restricted to
+  the points seen by at least one custom view (ray casting on the GT mesh, masks dilated as in
+  `cleanup`), with every per-point array of `attributes/` and `challenges/` subset by the same
+  mask, `keep.npy` (indices into the base cloud) and `variant_provenance.json`. Nothing is
+  resampled: the attributes, including `visibility_count`, keep their values on the default set.
+- `evaluate`, `apply-masks`, `curves`, `recompute`, `visualize` and `watch` read and write the
+  tagged directories; the default tree is never written. `aggregate`, `latex`, `figures`,
+  `proxy-curvature` and `preprocess-challenges` refuse variant mode.

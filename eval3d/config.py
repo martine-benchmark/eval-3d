@@ -1,5 +1,7 @@
 """Configuration system using Pydantic for validation."""
 
+import re
+import shlex
 from pathlib import Path
 from typing import Optional
 
@@ -57,6 +59,12 @@ class PathsConfig(BaseModel):
     watertight_masks: Optional[str] = Field(
         default=None,
         description="Optional watertight-issue mask directory; culling is enabled automatically when PNG masks exist.",
+    )
+    eval_cameras_override: Optional[str] = Field(
+        default=None,
+        description="Evaluation variant (with `variant`): camera file template overriding the evaluation cameras for "
+        "the two visibility cleanings only (reconstruction cleanup, GT restriction). Its masks are read from "
+        "<dir of the file>/masks/, its watertight masks from <dir>/masks_watertight/ when present.",
     )
     output_root: Optional[Path] = Field(default=None, description="Output directory for generated scripts and aggregated results")
 
@@ -226,6 +234,37 @@ class Config(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     aggregation: AggregationConfig = Field(default_factory=AggregationConfig)
     visualization: VisualizationConfig = Field(default_factory=VisualizationConfig)
+    variant: Optional[str] = Field(
+        default=None,
+        description="Evaluation variant tag (with paths.eval_cameras_override). Outputs go to "
+        "results_cleaned@<tag>/, eval_results@<tag>/ and Groundtruth@<tag>/; the default tree is only read.",
+    )
+
+    @model_validator(mode="after")
+    def validate_variant(self) -> "Config":
+        _check_variant(self.variant, self.paths.eval_cameras_override)
+        return self
+
+    def apply_variant(self, tag: str, eval_cameras: str) -> "Config":
+        """Switch this config to an evaluation variant (CLI --variant / --eval-cameras)."""
+        _check_variant(tag, eval_cameras)
+        self.variant = tag
+        self.paths.eval_cameras_override = str(eval_cameras)
+        return self
+
+    @property
+    def is_variant(self) -> bool:
+        return self.variant is not None
+
+    def tagged(self, name: str) -> str:
+        """`name` in the default mode, `name@<tag>` in variant mode."""
+        return f"{name}@{self.variant}" if self.is_variant else name
+
+    def variant_cli_args(self) -> str:
+        """Global CLI options reproducing the variant in a sub-job ('' in the default mode)."""
+        if not self.is_variant:
+            return ""
+        return f"--eval-cameras {shlex.quote(self.paths.eval_cameras_override)} --variant {self.variant}"
 
     def _resolve_template(self, template: str, object_name: str, method_name: str = None) -> Path:
         """Resolve path template with placeholders.
@@ -309,11 +348,27 @@ class Config(BaseModel):
 
         Published datasets can ship an exact sampled GT and its point-aligned
         attributes. Legacy configurations continue to read the writable
-        ``Groundtruth`` workspace.
+        ``Groundtruth`` workspace. In variant mode: the derived kit ``Groundtruth@<tag>``.
         """
+        if self.is_variant:
+            return self.get_variant_gt_dir(object_name)
+        return self.get_base_gt_artifacts_dir(object_name)
+
+    def get_base_gt_artifacts_dir(self, object_name: str) -> Path:
+        """GT artefacts of the default evaluation (the source of a variant's derived kit)."""
         if self.paths.gt_artifacts_root:
             return self._resolve_template(self.paths.gt_artifacts_root, object_name)
         return self.get_gt_dir(object_name)
+
+    def get_variant_gt_dir(self, object_name: str) -> Path:
+        """Derived GT kit of the variant: the base kit restricted to the points seen by its cameras."""
+        if not self.is_variant:
+            raise ValueError("get_variant_gt_dir needs an evaluation variant (--variant / --eval-cameras)")
+        return self.get_eval_root(object_name) / f"Groundtruth@{self.variant}"
+
+    def get_gt_derived_dir(self, object_name: str) -> Path:
+        """Writable directory for GT-side outputs of the evaluation (e.g. GT renders)."""
+        return self.get_variant_gt_dir(object_name) if self.is_variant else self.get_gt_dir(object_name)
 
     def get_challenges_raw_dir(self, object_name: str) -> Path:
         """Get the raw challenge-source directory (read-only, under gt_source)."""
@@ -414,9 +469,39 @@ class Config(BaseModel):
             return masks_dir
         return self.get_data_root(object_name, method_name) / "mask"
 
+    def get_cleaning_cameras_path(self, object_name: str, method_name: str = None) -> Path:
+        """Cameras of the two visibility cleanings (reconstruction cleanup, GT restriction).
+
+        The variant's override in variant mode, the evaluation cameras otherwise.
+        visibility_count, challenges and visualize keep get_cameras_path.
+        """
+        if self.is_variant:
+            return self._resolve_template(self.paths.eval_cameras_override, object_name, method_name)
+        return self.get_cameras_path(object_name, method_name)
+
+    def get_cleaning_masks_dir(self, object_name: str, method_name: str = None) -> Path:
+        """Masks of the cleaning cameras: <dir of the override>/masks/ in variant mode."""
+        if self.is_variant:
+            return self.get_cleaning_cameras_path(object_name, method_name).parent / "masks"
+        return self.get_masks_dir(object_name, method_name)
+
+    def get_cleaning_watertight_dir(self, object_name: str) -> Path:
+        """Watertight masks of the cleaning cameras.
+
+        Variant mode: <dir of the override>/masks_watertight/ only (absent = no watertight culling;
+        the default set's masks belong to other views and are never used).
+        """
+        if self.is_variant:
+            return self.get_cleaning_cameras_path(object_name).parent / "masks_watertight"
+        return self.get_watertight_masks_dir(object_name)
+
+    def get_lock_path(self, object_name: str, method_name: str, stage: str) -> Path:
+        """Failure lock of a stage (cleanup, eval, viz) for a method."""
+        return self.get_method_dir(object_name, method_name) / self.tagged(f".{stage}_failed")
+
     def get_eval_dir(self, object_name: str, method_name: str) -> Path:
         """Get the evaluation output directory."""
-        return self.get_method_dir(object_name, method_name) / "eval_results"
+        return self.get_method_dir(object_name, method_name) / self.tagged("eval_results")
 
     def get_raw_mesh_path(self, object_name: str, method_name: str) -> Path:
         """Get the raw mesh path by searching for .ply or .obj files in results_raw."""
@@ -441,13 +526,24 @@ class Config(BaseModel):
 
     def get_cleaned_mesh_path(self, object_name: str, method_name: str) -> Path:
         """Get the cleaned mesh path."""
-        return self.get_method_dir(object_name, method_name) / "results_cleaned" / "mesh.ply"
+        return self.get_method_dir(object_name, method_name) / self.tagged("results_cleaned") / "mesh.ply"
 
     def _resolve_downscale_suffix(self, downscale: str) -> str:
         """Convert downscale name to path suffix: d1->'', d2->'_d2', etc."""
         if downscale == "d1":
             return ""
         return f"_{downscale}"
+
+
+_VARIANT_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _check_variant(tag: Optional[str], eval_cameras: Optional[str]) -> None:
+    if (tag is None) != (eval_cameras is None):
+        raise ValueError("an evaluation variant needs both the tag (variant / --variant) and the camera file "
+                         "(paths.eval_cameras_override / --eval-cameras), together")
+    if tag is not None and not _VARIANT_TAG.fullmatch(tag):
+        raise ValueError(f"variant tag {tag!r}: letters, digits, '.', '_' and '-' only (it names directories)")
 
 
 def load_config(config_path: str | Path) -> Config:

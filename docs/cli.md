@@ -6,6 +6,7 @@ Every `eval-pipeline` subcommand in one table; the stage-by-stage flow is in [pi
 
 Every command takes `-c/--config` (required) and most take `-o/--object`, `-m/--method` and `-f/--force`.
 `uv run eval-pipeline -c <config> <command> --help` lists the options of one command.
+Global options `--eval-cameras <file.sfm> --variant <tag>` run a command on an evaluation variant (a custom camera set for the visibility cleanings, outputs in `@<tag>` directories): see [pipeline.md](pipeline.md#evaluation-variants-a-custom-camera-set).
 
 | Command | What it does |
 | :-- | :-- |

@@ -375,7 +375,7 @@ def test_derive_refuses_a_changed_camera_file_without_force(tmp_path):
 
 
 def _cleaned_vertices(cfg):
-    return trimesh.load(cfg.get_cleaned_mesh_path(OBJ, METHOD), process=False).vertices
+    return trimesh.load(cfg.get_cleaned_mesh_path(OBJ, METHOD), process=False, force="mesh").vertices
 
 
 def test_cleanup_follows_the_override(tmp_path):
@@ -543,7 +543,7 @@ def test_watcher_variant_commands(tmp_path, monkeypatch):
     np.save(cfg.get_gt_artifacts_dir(OBJ) / "gt_pcd.npy", np.zeros((1, 3)))
     calls = _submitted(monkeypatch, cfg, config_path, tmp_path)
     wraps = [c[c.index("--wrap") + 1] for c in calls]
-    opts = f"--eval-cameras {sfm.resolve()} --variant {TAG}"
+    opts = f"--eval-cameras {sfm} --variant {TAG}"
     assert wraps[0].endswith(f"eval-pipeline -c {config_path} {opts} cleanup --object {OBJ} --method {METHOD}")
     assert wraps[1].endswith(f"eval-pipeline -c {config_path} {opts} evaluate --object {OBJ} --method {METHOD}")
     assert any(a.startswith(f"--job-name=cleanup@{TAG}_") for a in calls[0])

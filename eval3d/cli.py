@@ -22,13 +22,41 @@ def _is_backup_path(path: Path) -> bool:
     return any(marker in part for part in path.parts for marker in _BACKUP_MARKERS)
 
 
+def _absolute_template(path: str) -> str:
+    """Absolute form of a path template (sub-jobs run from another directory)."""
+    p = Path(path).expanduser()
+    return str(p if p.is_absolute() else Path.cwd() / p)
+
+
+def _refuse_variant(config, command: str) -> None:
+    if config.is_variant:
+        raise click.ClickException(
+            f"{command} is not available in variant mode (variant {config.variant}): it would write "
+            "the default tree or untagged outputs"
+        )
+
+
 @click.group()
 @click.option("--config", "-c", type=click.Path(exists=True), required=True, help="Path to config YAML file")
+@click.option("--eval-cameras", "eval_cameras", default=None,
+              help="Evaluation variant: camera file (SfMData) overriding the evaluation cameras for the two "
+                   "visibility cleanings (reconstruction cleanup, GT restriction). Masks: <its dir>/masks/, "
+                   "watertight masks: <its dir>/masks_watertight/ if present. Requires --variant.")
+@click.option("--variant", "variant", default=None,
+              help="Evaluation variant tag: outputs go to results_cleaned@<tag>/, eval_results@<tag>/, "
+                   "Groundtruth@<tag>/. Requires --eval-cameras.")
 @click.pass_context
-def main(ctx, config):
+def main(ctx, config, eval_cameras, variant):
     """Evaluation pipeline for 3D reconstruction benchmarks."""
     ctx.ensure_object(dict)
+    if (eval_cameras is None) != (variant is None):
+        raise click.UsageError("--eval-cameras and --variant go together")
     cfg = load_config(config)
+    if variant is not None:
+        try:
+            cfg.apply_variant(variant, _absolute_template(eval_cameras))
+        except ValueError as e:
+            raise click.UsageError(str(e)) from e
     cfg._config_path = Path(config)
     ctx.obj["config"] = cfg
     ctx.obj["config_path"] = config
@@ -47,10 +75,16 @@ def main(ctx, config):
 @click.pass_context
 def preprocess_gt(ctx, object_name, curvature, curvature_radius, curvature_tube, curvature_max_edge, visibility,
                   use_masks, clean_gt, force):
-    """Preprocess ground truth: clean mesh, sample point cloud and compute attributes."""
+    """Preprocess ground truth: clean mesh, sample point cloud and compute attributes.
+
+    In variant mode: only derives Groundtruth@<tag>, the base kit restricted to the points seen by the
+    variant's cameras (--force rebuilds it).
+    """
     from .pipeline.preprocess_gt import preprocess_gt as _preprocess_gt
 
     config = ctx.obj["config"]
+    if config.is_variant:
+        click.echo(f"Variant {config.variant}: deriving Groundtruth@{config.variant} from the base kit")
     if use_masks is not None:
         config.cleanup.use_masks = use_masks
     if curvature_radius is not None:
@@ -75,6 +109,7 @@ def proxy_curvature(ctx, object_name, force):
     from .pipeline.preprocess_gt import proxy_curvature as _proxy_curvature
 
     config = ctx.obj["config"]
+    _refuse_variant(config, "proxy-curvature")
     for obj in [object_name] if object_name else config.dataset.objects:
         _proxy_curvature(config, obj, force)
 
@@ -88,6 +123,7 @@ def preprocess_challenges(ctx, object_name, force):
     from .pipeline.preprocess_challenges import preprocess_challenges as _preprocess
 
     config = ctx.obj["config"]
+    _refuse_variant(config, "preprocess-challenges")
     objects = [object_name] if object_name else config.dataset.objects
 
     for obj in objects:
@@ -116,8 +152,7 @@ def cleanup(ctx, object_name, method_name, use_masks, force):
 
     for obj in objects:
         for method in methods:
-            method_dir = config.get_method_dir(obj, method)
-            lock_path = method_dir / ".cleanup_failed"
+            lock_path = config.get_lock_path(obj, method, "cleanup")
             if force and lock_path.exists():
                 lock_path.unlink()
             try:
@@ -146,8 +181,7 @@ def evaluate(ctx, object_name, method_name, force):
 
     for obj in objects:
         for method in methods:
-            method_dir = config.get_method_dir(obj, method)
-            lock_path = method_dir / ".eval_failed"
+            lock_path = config.get_lock_path(obj, method, "eval")
             if force and lock_path.exists():
                 lock_path.unlink()
             try:
@@ -244,11 +278,13 @@ def watch(ctx, dry_run, scan_mode, state_file):
     config_path = Path(ctx.obj["config_path"])
     state_path = Path(state_file) if state_file else None
 
+    config = ctx.obj["config"]
     n_submitted = run_watcher(
         config_path=config_path,
         state_path=state_path,
         dry_run=dry_run,
-        scan_mode=scan_mode
+        scan_mode=scan_mode,
+        variant=(config.variant, config.paths.eval_cameras_override) if config.is_variant else None,
     )
 
     if dry_run:
@@ -264,10 +300,10 @@ def watch_status(ctx, state_file):
     """Show status of watched evaluation jobs."""
     from pathlib import Path
 
-    from .watcher.scanner import WatcherState
+    from .watcher.scanner import WatcherState, default_state_path
 
     config_path = Path(ctx.obj["config_path"])
-    state_path = Path(state_file) if state_file else config_path.parent / f".{config_path.stem}_state.json"
+    state_path = Path(state_file) if state_file else default_state_path(config_path, ctx.obj["config"])
 
     if not state_path.exists():
         click.echo("No state file found. Run 'watch' first.")
@@ -312,6 +348,7 @@ def aggregate(ctx, visibility_groups, curvature_thresholds):
     )
 
     config = ctx.obj["config"]
+    _refuse_variant(config, "aggregate")
 
     vis_groups = json.loads(visibility_groups) if visibility_groups else None
     curv_thresh = json.loads(curvature_thresholds) if curvature_thresholds else None
@@ -410,8 +447,7 @@ def visualize(ctx, object_name, method_name, metrics, views, scale, cmap, max_di
 
     for obj in objects:
         for method in methods:
-            method_dir = config.get_method_dir(obj, method)
-            lock_path = method_dir / ".viz_failed"
+            lock_path = config.get_lock_path(obj, method, "viz")
             if force and lock_path.exists():
                 lock_path.unlink()
             try:
@@ -550,6 +586,7 @@ def latex(ctx, output, decimals, no_mean):
     from .pipeline.latex_tables import generate_chamfer_table
 
     config = ctx.obj["config"]
+    _refuse_variant(config, "latex")
 
     tex = generate_chamfer_table(config, decimals=decimals, include_mean=not no_mean)
 
@@ -575,6 +612,7 @@ def figures(ctx, spec_path, out_dir, only):
     from .figures.run import run_figures
     from .figures.spec import load_spec
 
+    _refuse_variant(ctx.obj["config"], "figures")
     run_figures(ctx.obj["config"], load_spec(spec_path), out_dir, list(only) or None)
     click.echo(f"Written to {out_dir}")
 

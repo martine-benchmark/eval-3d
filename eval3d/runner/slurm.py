@@ -60,7 +60,7 @@ class SlurmRunner(JobRunner):
             templates_dir = pkg_dir / "slurm" / "templates"
 
         self.templates_dir = Path(templates_dir)
-        self.scripts_dir = Path(scripts_dir) if scripts_dir else config.paths.output_root / "slurm_scripts"
+        self.scripts_dir = Path(scripts_dir) if scripts_dir else config.paths.output_root / config.tagged("slurm_scripts")
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
 
         self.env = Environment(loader=FileSystemLoader(str(self.templates_dir)))
@@ -101,6 +101,7 @@ class SlurmRunner(JobRunner):
             method=safe_method,
             config_path=job.config_path,
             job_name=f"{job.stage}_{safe_object}_{safe_method}",
+            variant_opts=(" " + self.config.variant_cli_args()) if self.config.is_variant else "",
         )
 
         script_path = self.scripts_dir / f"{job.stage}_{safe_object}_{safe_method}.sh"

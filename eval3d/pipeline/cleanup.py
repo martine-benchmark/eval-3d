@@ -7,6 +7,7 @@ from ..config import Config
 from ..core.camera import load_cameras_auto
 from ..core.mesh import filter_mesh_by_vertex_mask, load_mesh, save_mesh
 from ..core.visibility import filter_by_issue_watertight, filter_by_visibility
+from .variant_gt import require_view_masks
 
 
 def cleanup_mesh(
@@ -34,8 +35,9 @@ def cleanup_mesh(
     """
     raw_mesh_path = config.get_raw_mesh_path(object_name, method_name)
     cleaned_mesh_path = config.get_cleaned_mesh_path(object_name, method_name)
-    cameras_path = config.get_cameras_path(object_name, method_name)
-    masks_dir = config.get_masks_dir(object_name, method_name)
+    # The evaluation cameras, or the variant's override (--eval-cameras).
+    cameras_path = config.get_cleaning_cameras_path(object_name, method_name)
+    masks_dir = config.get_cleaning_masks_dir(object_name, method_name)
 
     if not raw_mesh_path.exists():
         raise FileNotFoundError(f"Raw mesh not found: {raw_mesh_path}")
@@ -73,6 +75,9 @@ def cleanup_mesh(
 
     cameras = load_cameras_auto(cameras_path)
     print(f"  Loaded {len(cameras['P'])} camera views")
+    if config.is_variant:
+        # A view without its mask would be skipped silently: on a custom set, that is an error.
+        require_view_masks(cameras, masks_dir)
 
     print(f"  Filtering by visibility (dilation={config.cleanup.dilation_radius}, use_masks={config.cleanup.use_masks})")
     visible_mask = filter_by_visibility(
@@ -94,9 +99,12 @@ def cleanup_mesh(
     # project into the per-view hole-region masks (surfaces filling the GT's non-watertight
     # Optional third mask family. Its presence is the feature flag: published
     # kits without it retain the ordinary silhouette cleanup.
-    issue_dir = config.get_watertight_masks_dir(object_name)
+    issue_dir = config.get_cleaning_watertight_dir(object_name)
     if issue_dir.exists() and any(issue_dir.glob("*.png")):
         print(f"  Watertight culling using: {issue_dir}")
+        # Default set: masks paired with the views by glob order. Variant: by view name, since the
+        # custom set's view order need not follow the file names.
+        issue_paths = require_view_masks(cameras, issue_dir) if config.is_variant else None
         issue_counts = filter_by_issue_watertight(
             mesh.vertices,
             mesh,
@@ -105,6 +113,7 @@ def cleanup_mesh(
             visible_mask=visible_mask,
             orientation_ratio_threshold=config.cleanup.watertight_orientation_ratio,
             show_progress=True,
+            mask_paths=issue_paths,
         )
         keep_mask = visible_mask & (issue_counts == 0)
         n_culled = n_visible - int(np.sum(keep_mask))
