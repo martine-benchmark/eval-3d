@@ -29,7 +29,12 @@ from PIL import Image
 from eval3d.cli import main
 from eval3d.config import Config, load_config
 from eval3d.core.camera import load_cameras_auto
-from eval3d.core.visibility import compute_auto_dilation, compute_visibility_count
+from eval3d.core.visibility import (
+    check_points_in_mask,
+    compute_auto_dilation,
+    compute_visibility_count,
+    filter_by_visibility,
+)
 
 W, H = 64, 48
 OBJ, METHOD, TAG = "obj", "m", "front"
@@ -299,6 +304,39 @@ def test_derive_keeps_points_seen_by_the_override(tmp_path):
     assert prov["kept_fraction"] == pytest.approx(expected.mean())
     assert prov["dilation_radius"] == "auto" and prov["use_masks"] is True
     assert prov["base_gt_dir"] == str(kit)
+
+
+def test_derive_carves_by_silhouette_like_cleanup(tmp_path):
+    """Same rule as cleanup: a GT point inside a view's image but outside its (dilated) mask is removed,
+    even when another view sees it unoccluded."""
+    from eval3d.pipeline.variant_gt import derive_variant_gt
+
+    config_path = _scene(tmp_path)
+    sfm = _write_override(tmp_path, [("000", "A"), ("001", "B")], name="carve")
+    half = np.full((H, W), 255, dtype=np.uint8)
+    half[:, : W // 2] = 0   # camera A: left half of the image outside the silhouette
+    Image.fromarray(half).save(sfm.parent / "masks" / "000.png")
+    cfg = _variant_config(config_path, sfm, "carve")
+    out = derive_variant_gt(cfg, OBJ)
+
+    pcd = np.load(tmp_path / "kit" / OBJ / "gt_pcd.npy")
+    cams = load_cameras_auto(sfm)
+    radius = compute_auto_dilation(W * H, 4, W * H)
+    _, in_a = check_points_in_mask(pcd, cams["P"][0], half > 0, radius, cams["pixel_centre"])
+    bottom_carved = (pcd[:, 2] < 0) & ~in_a      # seen by B, but outside A's silhouette
+    assert bottom_carved.any() and in_a.any() and not in_a.all()
+    keep = np.zeros(len(pcd), dtype=bool)
+    keep[np.load(out / "keep.npy")] = True
+    assert not keep[bottom_carved].any()
+    np.testing.assert_array_equal(keep, in_a)    # every point is seen by A (top) or B (bottom)
+
+    # and it is exactly cleanup's rule
+    expected = filter_by_visibility(
+        pcd, trimesh.load(tmp_path / "gt" / OBJ / "gt.ply", process=False), cams, sfm.parent / "masks",
+        dilation_radius="auto", show_progress=False, use_masks=True, dilation_ref_px=4, dilation_ref_n_pixels=W * H,
+    )
+    np.testing.assert_array_equal(keep, expected)
+    assert json.loads((out / "variant_provenance.json").read_text())["rule"] == "filter_by_visibility"
 
 
 def test_derive_with_both_cameras_keeps_everything(tmp_path):
