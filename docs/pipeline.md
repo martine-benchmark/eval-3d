@@ -72,8 +72,8 @@ exists, otherwise there is no watertight culling.
 
 - `cleanup` carves the reconstruction with the custom views (`results_raw/` is shared).
 - `preprocess-gt` only derives `Groundtruth@<tag>/`: the base kit's `gt_pcd.npy` restricted to
-  the points seen by at least one custom view (ray casting on the GT mesh, masks dilated as in
-  `cleanup`), with every per-point array of `attributes/` and `challenges/` subset by the same
+  the points kept by the same rule as `cleanup` on the custom views (`filter_by_visibility`: same
+  masks and dilation, silhouette carving, then seen unoccluded by at least one view), with every per-point array of `attributes/` and `challenges/` subset by the same
   mask, `keep.npy` (indices into the base cloud) and `variant_provenance.json`. Nothing is
   resampled: the attributes, including `visibility_count`, keep their values on the default set.
 - `evaluate`, `apply-masks`, `curves`, `recompute`, `visualize` and `watch` read and write the

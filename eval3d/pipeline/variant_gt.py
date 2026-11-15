@@ -1,8 +1,10 @@
 """GT kit of an evaluation variant: the base kit restricted to the points seen by the custom cameras.
 
-Nothing is resampled or recomputed. The base `gt_pcd.npy` keeps the points visible from at least one
-view of the override (`paths.eval_cameras_override` / `--eval-cameras`): ray casting on the GT mesh
-and the override's dilated masks, as `compute_visibility_count` with the cleanup dilation settings.
+Nothing is resampled or recomputed. The base `gt_pcd.npy` is filtered by the views of the override
+(`paths.eval_cameras_override` / `--eval-cameras`) with the same rule as the reconstruction cleanup
+and the GT cleaning, `filter_by_visibility`: same masks, same dilation; a point inside a view's image
+but outside its dilated mask is removed (silhouette carving), the others are kept if at least one
+view sees them unoccluded (ray casting on the GT mesh).
 Every per-point array of the kit (`gt_pcd.npy`, `attributes/*.npy`, `challenges/*.npy`, exclusion
 masks included) is indexed by the same keep mask, so the attributes stay aligned; the other files of
 the kit's scoring subtrees are copied. The result is written to `Groundtruth@<tag>/` with `keep.npy`
@@ -127,7 +129,7 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
     kit derived with other ones is refused unless `force`.
     """
     from ..core.camera import load_cameras_auto
-    from ..core.visibility import compute_visibility_count
+    from ..core.visibility import filter_by_visibility
 
     if not config.is_variant:
         raise ValueError("derive_variant_gt needs an evaluation variant (--variant / --eval-cameras)")
@@ -149,6 +151,7 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
         "eval_cameras": str(cameras_path),
         "eval_cameras_md5": _md5(cameras_path),
         "base_gt_dir": str(base),
+        "rule": "filter_by_visibility",
         "use_masks": bool(c.use_masks),
         "dilation_radius": c.dilation_radius if isinstance(c.dilation_radius, str) else int(c.dilation_radius),
         "dilation_ref_px": int(c.dilation_ref_px),
@@ -179,15 +182,15 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
     mesh, mesh_paths = _occluder(config, object_name)
     print(f"  Occluder: {len(mesh.vertices):,} vertices, {len(mesh.faces):,} faces")
 
-    count = compute_visibility_count(
+    # Same call as cleanup_mesh, on the GT points.
+    keep = filter_by_visibility(
         gt_pcd, mesh, cameras, masks_dir,
-        dilation_radius=c.dilation_radius if c.use_masks else 0,
+        dilation_radius=c.dilation_radius,
         show_progress=True,
         use_masks=c.use_masks,
         dilation_ref_px=c.dilation_ref_px,
         dilation_ref_n_pixels=c.dilation_ref_n_pixels,
     )
-    keep = count > 0
     n_kept = int(keep.sum())
     print(f"  Kept {n_kept:,} / {n_base:,} GT points ({100.0 * n_kept / n_base:.2f}%)")
     if n_kept == 0:
