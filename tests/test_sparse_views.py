@@ -10,7 +10,9 @@ Two cleaning steps:
 4. evaluation -> `eval_results@<tag>/`.
 
 The tag is the file name of the custom file (`--variant` sets another one). Without `--views`
-nothing changes. A custom file holding all the evaluation views gives the default result.
+nothing changes. A custom file holding all the evaluation views gives the default result when the
+GT point cloud is entirely seen by them, as in this synthetic scene; a published `gt_pcd` loses a
+few points at step 3 even then (accepted, see docs/pipeline.md).
 
 Synthetic scene: two square plates (z = +1 facing +z, z = -1 facing -z) and two cameras, A above
 (world z = +10, looking down) and B below (z = -10, looking up). Each plate occludes the other, so
@@ -504,8 +506,9 @@ def test_second_step_refuses_a_changed_view_file_without_force(tmp_path):
 
 
 def test_all_evaluation_views_give_the_default_result(tmp_path):
-    """Control: a custom file holding the evaluation views themselves changes nothing, for the
-    reconstruction and for the GT."""
+    """Control: a custom file holding the evaluation views themselves changes nothing here, for the
+    reconstruction and for the GT (every GT point of this scene is seen by them; a published gt_pcd
+    loses a few points at step 3, see test_gt_points_unseen_by_all_the_views_are_removed)."""
     config_path = _scene(tmp_path)
     base = load_config(config_path)
     assert _cli(config_path, "run", "-w", "1").exit_code == 0
@@ -531,6 +534,23 @@ def test_all_evaluation_views_give_the_default_result(tmp_path):
     assert d1.name == "eval_results@all"
     h0, h1 = _tree_hashes(d0), _tree_hashes(d1)
     assert h0 and h0 == h1
+
+
+def test_gt_points_unseen_by_all_the_views_are_removed(tmp_path):
+    """The GT has no step 1: points of the published cloud that no evaluation view sees (here one
+    between the two plates) are removed at step 3, even with all the evaluation views."""
+    from eval3d.pipeline.variant_gt import derive_variant_gt
+
+    config_path = _scene(tmp_path)
+    kit = tmp_path / "kit" / OBJ
+    pcd = np.load(kit / "gt_pcd.npy")
+    hidden = len(pcd) // 2
+    pcd[hidden] = [0.0, 0.0, 0.0]   # between the plates: occluded from A and from B
+    np.save(kit / "gt_pcd.npy", pcd)
+    sfm = _write_override(tmp_path, [("000", "A"), ("001", "B")], name="all")
+    out = derive_variant_gt(_variant_config(config_path, sfm, "all"), OBJ)
+    np.testing.assert_array_equal(np.load(out / "keep.npy"), np.delete(np.arange(len(pcd)), hidden))
+    assert len(np.load(out / "attributes" / "visibility_count.npy")) == len(pcd) - 1
 
 
 def test_run_views_does_the_four_steps(tmp_path):

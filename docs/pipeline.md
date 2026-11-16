@@ -87,16 +87,25 @@ with one view per camera. The silhouette of a view is `<dir of the file>/masks/<
 is an error.
 
 **The tag** is the file name without its extension (`front3.sfm` gives `@front3`); `--variant <tag>`
-sets another one. One tag per view set: an existing `@<tag>` output made from another file or other
+sets another one. The files written by `martine-convert subsets --write-eval-sfm` are named for
+this: `<preset>.sfm`, or `views<N>.sfm` for a subset of N views. One tag per view set: an existing `@<tag>` output made from another file or other
 settings is refused, `--force` (on `cleanup` and `preprocess-gt`) rebuilds it.
 
 **Watertight masks are applied at step 1 only.** They mark the holes of the GT (e.g. the inside of
 a shoe) and only remove vertices of the reconstruction. Step 1 has removed them, so the custom view
 set needs no watertight masks, and the GT, which has no surface there, is not concerned.
 
-**The GT has no step 1**: the published `gt_pcd.npy` is already cleaned with all the evaluation
-views. Control: a custom file holding all the evaluation views gives the result of the usual
-evaluation, for the reconstruction and for the GT.
+**The GT has no step 1.** The published `gt_pcd.npy` comes from the GT mesh cleaned with all the
+evaluation views, and it is filtered once, by the custom views (step 3). That filter still removes
+a few of its points when the custom file holds all the evaluation views: on the 26 published
+objects, 81 338 points of 252 025 956 (0.03 %), from 2 points (rock) to 0.16 % of an object
+(grid), at most 150 points for 15 objects. Most of them have a published `visibility_count` of 0.
+This loss is accepted.
+
+**Control: a custom file holding all the evaluation views.** The reconstruction is the one of the
+usual evaluation: step 2 keeps every vertex of step 1. The GT is not identical: it loses the few
+points above, so the metrics move slightly (vase: Chamfer 0.329295 instead of 0.329303, 57 GT
+points of 5 483 182 removed).
 
 `--views` (and `--variant`) are also global options, for the commands run one by one:
 
