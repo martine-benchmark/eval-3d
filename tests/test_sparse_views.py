@@ -12,7 +12,7 @@ Two cleaning steps:
 The tag is the file name of the custom file (`--variant` sets another one). Without `--views`
 nothing changes. A custom file holding all the evaluation views gives the default result when the
 GT point cloud is entirely seen by them, as in this synthetic scene; a published `gt_pcd` loses a
-few points at step 3 even then (accepted, see docs/pipeline.md).
+few points at step 3 even then (accepted).
 
 Synthetic scene: two square plates (z = +1 facing +z, z = -1 facing -z) and two cameras, A above
 (world z = +10, looking down) and B below (z = -10, looking up). Each plate occludes the other, so
