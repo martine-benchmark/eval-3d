@@ -87,6 +87,13 @@ class CleanupConfig(BaseModel):
     dilation_ref_n_pixels: int = Field(default=9568 * 6376, gt=0, description="Auto-dilation reference resolution in total pixels (H*W). Default = 9568x6376 (Martine full res). Auto radius = round(dilation_ref_px * sqrt(mask_n_pixels / dilation_ref_n_pixels))")
     z_threshold: Optional[float] = Field(default=None, description="Remove points below this z")
     use_masks: bool = Field(default=True, description="Use 2D masks for visibility filtering")
+    views_max_normal_angle: float = Field(
+        default=90.0, gt=0, le=180,
+        description="Sparse-view evaluation (--views) only: in the second cleaning step of the reconstruction and "
+        "of the GT point cloud, a custom view counts for a point only if it sees it from its front, i.e. the angle "
+        "(degrees) between the point's normal and the direction from the point to the camera is strictly below "
+        "this value. 90 = front side (normal . (camera - point) > 0).",
+    )
     watertight_orientation_ratio: float = Field(default=0.7, description="If < this fraction of sampled visible points face camera 0, flip normals before watertight_culling")
 
     @field_validator("dilation_radius")

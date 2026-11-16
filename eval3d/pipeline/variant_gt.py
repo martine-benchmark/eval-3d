@@ -3,9 +3,10 @@
 Nothing is resampled or recomputed. The base `gt_pcd.npy` (the published one, already cleaned with
 all the evaluation views) is filtered by the views of the custom set (`paths.views` / `--views`)
 with the same call as the second cleaning step of the reconstruction, `filter_by_visibility`: same
-silhouettes, same dilation, no watertight masks; a point inside a view's image but outside its
-dilated mask is removed (silhouette carving), the others are kept if at least one view sees them
-unoccluded (ray casting on the GT mesh).
+silhouettes, same dilation, same orientation test, no watertight masks; a point inside a view's
+image but outside its dilated mask is removed (silhouette carving), the others are kept if at least
+one view sees them unoccluded (ray casting on the GT mesh) and from their front (the normal of a GT
+point is the vertex normal of the nearest vertex of the GT mesh).
 Every per-point array of the kit (`gt_pcd.npy`, `attributes/*.npy`, `challenges/*.npy`, exclusion
 masks included) is indexed by the same keep mask, so the attributes stay aligned; the other files of
 the kit's scoring subtrees are copied. The result is written to `Groundtruth@<tag>/` with `keep.npy`
@@ -66,7 +67,20 @@ def visibility_settings(config, views_path: Path) -> dict:
         "dilation_radius": c.dilation_radius if isinstance(c.dilation_radius, str) else int(c.dilation_radius),
         "dilation_ref_px": int(c.dilation_ref_px),
         "dilation_ref_n_pixels": int(c.dilation_ref_n_pixels),
+        "views_max_normal_angle": float(c.views_max_normal_angle),
     }
+
+
+def nearest_vertex_normals(points: np.ndarray, mesh) -> np.ndarray:
+    """Normal of each point: the vertex normal of the nearest vertex of ``mesh``."""
+    from scipy.spatial import cKDTree
+
+    _, nearest = cKDTree(np.asarray(mesh.vertices)).query(np.asarray(points, dtype=np.float64), workers=-1)
+    return np.asarray(mesh.vertex_normals, dtype=np.float64)[nearest]
+
+
+def count_undefined_normals(normals: np.ndarray) -> int:
+    return int((np.linalg.norm(normals, axis=1) == 0.0).sum())
 
 
 def _kit_layout(base: Path, n_base: int) -> tuple[list[str], list[str], list[str]]:
@@ -189,6 +203,7 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
     print(f"  Occluder: {len(mesh.vertices):,} vertices, {len(mesh.faces):,} faces")
 
     # Same call as the second cleaning step of the reconstruction, on the GT points.
+    normals = nearest_vertex_normals(gt_pcd, mesh)
     keep = filter_by_visibility(
         gt_pcd, mesh, cameras, masks_dir,
         dilation_radius=c.dilation_radius,
@@ -196,6 +211,8 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
         use_masks=c.use_masks,
         dilation_ref_px=c.dilation_ref_px,
         dilation_ref_n_pixels=c.dilation_ref_n_pixels,
+        normals=normals,
+        max_normal_angle=c.views_max_normal_angle,
     )
     n_kept = int(keep.sum())
     print(f"  Kept {n_kept:,} / {n_base:,} GT points ({100.0 * n_kept / n_base:.2f}%)")
@@ -230,6 +247,8 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
             "masks_dir": str(masks_dir),
             "dilation_px_per_view": _dilation_per_view(config, mask_paths),
             "occluder_mesh": mesh_paths,
+            "normals": "vertex normal of the nearest vertex of the occluder mesh",
+            "n_undefined_normals": count_undefined_normals(normals),
             "n_base": n_base,
             "n_kept": n_kept,
             "kept_fraction": n_kept / n_base,

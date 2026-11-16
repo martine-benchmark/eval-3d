@@ -7,7 +7,7 @@ from ..config import Config
 from ..core.camera import load_cameras_auto
 from ..core.mesh import filter_mesh_by_vertex_mask, load_mesh, save_mesh
 from ..core.visibility import filter_by_issue_watertight, filter_by_visibility
-from .variant_gt import require_view_masks, visibility_settings
+from .variant_gt import count_undefined_normals, require_view_masks, visibility_settings
 
 
 def cleanup_mesh(
@@ -147,6 +147,9 @@ def cleanup_mesh_views(
     2. The same visibility filter (`filter_by_visibility`, same dilation) on that cleaned mesh
        with the cameras and silhouettes of the custom view set, to results_cleaned@<tag>/mesh.ply.
        No watertight masks here: they only remove vertices, and step 1 has applied them.
+       A view counts for a vertex only if it sees it from its front (vertex normals of the step-1
+       mesh, `cleanup.views_max_normal_angle`): step 1 has opened holes in the mesh, and a surface
+       seen from behind through them is not kept.
 
     `force` rebuilds step 2 only.
     """
@@ -184,12 +187,14 @@ def cleanup_mesh_views(
         # Failed reconstruction: keep the empty mesh, scored as a failure by evaluate().
         import trimesh
         save_mesh(trimesh.Trimesh(), out_path)
-        views, n_kept = [], 0
+        views, n_kept, n_undefined = [], 0, 0
     else:
         cameras = load_cameras_auto(views_path)
         require_view_masks(cameras, masks_dir)
         views = [name.rsplit(".", 1)[0] for name in cameras["mask_names"]]
         print(f"  {len(views)} view(s): {', '.join(views)}")
+        normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
+        n_undefined = count_undefined_normals(normals)
         keep_mask = filter_by_visibility(
             mesh.vertices,
             mesh,
@@ -200,6 +205,8 @@ def cleanup_mesh_views(
             use_masks=config.cleanup.use_masks,
             dilation_ref_px=config.cleanup.dilation_ref_px,
             dilation_ref_n_pixels=config.cleanup.dilation_ref_n_pixels,
+            normals=normals,
+            max_normal_angle=config.cleanup.views_max_normal_angle,
         )
         n_kept = int(np.sum(keep_mask))
         print(f"  Kept {n_kept} / {n_source} vertices of the cleaned mesh ({100 * n_kept / n_source:.1f}%)")
@@ -216,5 +223,7 @@ def cleanup_mesh_views(
         "source_mesh": str(source_path),
         "n_source_vertices": n_source,
         "n_kept_vertices": n_kept,
+        "normals": "vertex normals of the source mesh",
+        "n_undefined_normals": n_undefined,
     }, indent=2))
     print(f"  Saved: {out_path}")

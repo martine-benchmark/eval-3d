@@ -311,6 +311,27 @@ def estimate_normal_flip(
     return oriented_dot_visible_front < 0.5 * oriented_dot_visible_total
 
 
+def facing_camera(
+    points: np.ndarray,
+    normals: np.ndarray,
+    camera_center: np.ndarray,
+    max_angle: float = 90.0,
+) -> np.ndarray:
+    """True where the angle between a point's normal and the direction from the point to the
+    camera is strictly below ``max_angle`` degrees.
+
+    With the default 90, this is ``normal . (camera - point) > 0``. A point whose normal is
+    undefined (zero vector) faces no camera.
+    """
+    normals = np.asarray(normals, dtype=np.float64)
+    to_camera = np.asarray(camera_center, dtype=np.float64) - np.asarray(points, dtype=np.float64)
+    dot = np.einsum("ij,ij->i", normals, to_camera)
+    if max_angle == 90.0:
+        return dot > 0.0
+    norms = np.linalg.norm(normals, axis=1) * np.linalg.norm(to_camera, axis=1)
+    return (norms > 0.0) & (dot > np.cos(np.deg2rad(max_angle)) * norms)
+
+
 def filter_by_visibility(
     vertices: np.ndarray,
     mesh: trimesh.Trimesh,
@@ -321,6 +342,8 @@ def filter_by_visibility(
     use_masks: bool = True,
     dilation_ref_px: int = AUTO_DILATION_REF_PX,
     dilation_ref_n_pixels: int = AUTO_DILATION_REF_N_PIXELS,
+    normals: np.ndarray | None = None,
+    max_normal_angle: float = 90.0,
 ) -> np.ndarray:
     """Create a vertex mask keeping only vertices visible from at least one view.
 
@@ -340,6 +363,11 @@ def filter_by_visibility(
         use_masks: Whether to use 2D masks for filtering.
         dilation_ref_px: Auto-dilation reference radius (pixels at the reference res).
         dilation_ref_n_pixels: Auto-dilation reference resolution (total pixels).
+        normals: Optional point normals, shape (N, 3). When given, a view counts for a
+            point only if it also sees it from its front: the angle between the normal and
+            the direction from the point to the camera is strictly below ``max_normal_angle``
+            (see :func:`facing_camera`). None (default): no orientation test.
+        max_normal_angle: Angle threshold in degrees of that test (90 = front side).
 
     Returns:
         Boolean mask, True for visible vertices, shape (N,).
@@ -473,6 +501,10 @@ def filter_by_visibility(
 
     # A vertex is visible if: not hit (not occluded) AND in mask (or bounds) for that view
     visible_per_view = ~hits_all_views & in_view_all_views
+    if normals is not None:
+        # ... AND seen from its front: a surface seen from behind through a hole does not count.
+        for view_idx in range(n_views):
+            visible_per_view[view_idx] &= facing_camera(vertices, normals, camera_centers[view_idx], max_normal_angle)
     visible_any = visible_per_view.any(axis=0)
 
     # Final mask: passed mask filtering AND visible from at least one view

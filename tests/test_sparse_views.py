@@ -4,15 +4,17 @@ Two cleaning steps:
 
 1. the usual cleanup (all evaluation views, silhouettes, watertight masks) -> `results_cleaned/`;
 2. the same `filter_by_visibility` on the step-1 mesh with the cameras and silhouettes of the custom
-   file (`<its dir>/masks/`), without watertight masks -> `results_cleaned@<tag>/`;
+   file (`<its dir>/masks/`), without watertight masks -> `results_cleaned@<tag>/`; a view counts
+   for a point only if it sees it from its front (`cleanup.views_max_normal_angle`, default 90);
 3. the same step 2 on the published GT point cloud -> `Groundtruth@<tag>/` (every per-point array
    indexed by the same keep mask, `keep.npy`);
 4. evaluation -> `eval_results@<tag>/`.
 
 The tag is the file name of the custom file (`--variant` sets another one). Without `--views`
-nothing changes. A custom file holding all the evaluation views gives the default result when the
-GT point cloud is entirely seen by them, as in this synthetic scene; a published `gt_pcd` loses a
-few points at step 3 even then (accepted).
+nothing changes. A custom file holding all the evaluation views gives the default result only when
+every vertex kept by the usual cleanup and every GT point is seen from its front by one of them, as
+in this synthetic scene: the orientation test and the GT filter belong to the `--views` mode, the
+usual cleanup has neither.
 
 Synthetic scene: two square plates (z = +1 facing +z, z = -1 facing -z) and two cameras, A above
 (world z = +10, looking down) and B below (z = -10, looking up). Each plate occludes the other, so
@@ -502,13 +504,191 @@ def test_second_step_refuses_a_changed_view_file_without_force(tmp_path):
     assert (_cleaned_vertices(cfg)[:, 2] < 0).all()
 
 
+# --------------------------------------------------------------------------- orientation test
+
+
+def _bottom_plate_seen_from_above(tmp_path):
+    """The bottom plate alone (normal -z): camera A, above, sees its back; camera B, below, its front."""
+    mesh = _plate(-1.0, N_GRID, up=False)
+    sfm = _write_sfm(tmp_path / "ab" / "ab.sfm", [("000", "A"), ("001", "B")])
+    _write_masks(sfm.parent / "masks", ["000", "001"])
+    return mesh, load_cameras_auto(sfm), sfm.parent / "masks"
+
+
+def _one_camera(cams, i):
+    out = dict(cams)
+    for k in ("K", "K_inv", "P", "P_inv", "Rt", "scale", "scale_inv"):
+        if k in out:
+            out[k] = out[k][i:i + 1]
+    out["mask_names"] = cams["mask_names"][i:i + 1]
+    return out
+
+
+def test_filter_by_visibility_orientation_test(tmp_path):
+    mesh, cams, masks = _bottom_plate_seen_from_above(tmp_path)
+    kw = dict(dilation_radius=0, show_progress=False)
+    normals = np.asarray(mesh.vertex_normals)
+    assert (normals[:, 2] < -0.99).all()
+    above, below = _one_camera(cams, 0), _one_camera(cams, 1)
+    # without normals (the usual cleanup): seen is enough
+    assert filter_by_visibility(mesh.vertices, mesh, above, masks, **kw).all()
+    # with normals: the view above sees only the back of the plate, the view below its front
+    assert not filter_by_visibility(mesh.vertices, mesh, above, masks, normals=normals, **kw).any()
+    assert filter_by_visibility(mesh.vertices, mesh, below, masks, normals=normals, **kw).all()
+    assert filter_by_visibility(mesh.vertices, mesh, cams, masks, normals=normals, **kw).all()
+    # an undefined normal faces no camera
+    broken = normals.copy()
+    broken[0] = 0.0
+    keep = filter_by_visibility(mesh.vertices, mesh, below, masks, normals=broken, **kw)
+    assert not keep[0] and keep[1:].all()
+
+
+def test_facing_camera_threshold():
+    from eval3d.core.visibility import facing_camera
+
+    cam = np.array([0.0, 0.0, 10.0])
+    pts = np.zeros((5, 3))
+    ang = np.deg2rad([0.0, 30.0, 89.0, 90.0, 120.0])       # angle between the normal and the camera direction
+    normals = np.column_stack([np.sin(ang), np.zeros(5), np.cos(ang)])
+    normals[3] = [1.0, 0.0, 0.0]                             # exactly 90 degrees
+    np.testing.assert_array_equal(facing_camera(pts, normals, cam), [True, True, True, False, False])   # strict
+    np.testing.assert_array_equal(facing_camera(pts, normals, cam, 45.0), [True, True, False, False, False])
+    np.testing.assert_array_equal(facing_camera(pts, normals, cam, 150.0), [True, True, True, True, True])
+
+
+def _holed_scene(tmp_path):
+    """Default watertight masks, white for view 000 only: step 1 removes the top plate (what camera A
+    sees from its front). Through that hole, A then sees the back of the bottom plate."""
+    config_path = _scene(tmp_path)
+    _write_masks(tmp_path / "gt" / OBJ / "masks_watertight", ["000"])
+    _write_masks(tmp_path / "gt" / OBJ / "masks_watertight", ["001"], value=0)
+    return config_path
+
+
+def test_vertex_seen_from_behind_through_a_hole_is_removed(tmp_path):
+    from eval3d.pipeline.cleanup import cleanup_mesh
+
+    config_path = _holed_scene(tmp_path)
+    base = load_config(config_path)
+    sfm_a = _write_override(tmp_path, [("000", "A")], name="above")
+    cfg_a = _variant_config(config_path, sfm_a, "above")
+    cleanup_mesh(cfg_a, OBJ, METHOD)
+    step1 = trimesh.load(base.get_cleaned_mesh_path(OBJ, METHOD), process=False, force="mesh")
+    assert len(step1.vertices) and (step1.vertices[:, 2] < 0).all()        # the bottom plate, holed above
+    # A sees it unoccluded...
+    seen = filter_by_visibility(step1.vertices, step1, load_cameras_auto(sfm_a), sfm_a.parent / "masks",
+                                dilation_radius="auto", show_progress=False, dilation_ref_px=4,
+                                dilation_ref_n_pixels=W * H)
+    assert seen.all()
+    # ... but from behind: nothing is kept
+    assert len(_cleaned_vertices(cfg_a)) == 0
+    prov = json.loads((cfg_a.get_cleaned_mesh_path(OBJ, METHOD).parent / "views_provenance.json").read_text())
+    assert prov["views_max_normal_angle"] == 90.0 and prov["n_kept_vertices"] == 0
+
+    # a view on the other side sees the same vertices from their front: kept
+    sfm_b = _write_override(tmp_path, [("001", "B")], name="below")
+    cfg_b = _variant_config(config_path, sfm_b, "below")
+    cleanup_mesh(cfg_b, OBJ, METHOD)
+    assert len(_cleaned_vertices(cfg_b)) == len(step1.vertices)
+
+
+def test_orientation_threshold_is_read_from_the_config(tmp_path):
+    from eval3d.pipeline.cleanup import cleanup_mesh
+
+    config_path = _holed_scene(tmp_path)
+    sfm = _write_override(tmp_path, [("000", "A")], name="above")
+    raw = yaml.safe_load(config_path.read_text())
+    raw["cleanup"]["views_max_normal_angle"] = 179.0     # nearly no orientation test
+    config_path.write_text(yaml.safe_dump(raw))
+    cfg = _variant_config(config_path, sfm, "above")
+    assert cfg.cleanup.views_max_normal_angle == 179.0
+    cleanup_mesh(cfg, OBJ, METHOD)
+    kept = _cleaned_vertices(cfg)
+    step1 = trimesh.load(load_config(config_path).get_cleaned_mesh_path(OBJ, METHOD), process=False, force="mesh")
+    # seen from behind at 171 to 180 degrees: kept below 179, the few vertices right under the camera are not
+    assert 0.5 * len(step1.vertices) < len(kept) < len(step1.vertices)
+    prov_path = cfg.get_cleaned_mesh_path(OBJ, METHOD).parent / "views_provenance.json"
+    assert json.loads(prov_path.read_text())["views_max_normal_angle"] == 179.0
+
+    # another threshold is another setting: refused without --force
+    raw["cleanup"]["views_max_normal_angle"] = 90.0
+    config_path.write_text(yaml.safe_dump(raw))
+    strict = _variant_config(config_path, sfm, "above")
+    with pytest.raises(ValueError, match="views_max_normal_angle"):
+        cleanup_mesh(strict, OBJ, METHOD)
+    cleanup_mesh(strict, OBJ, METHOD, force=True)
+    assert len(_cleaned_vertices(strict)) == 0
+
+    for bad in (0.0, -10.0, 181.0):
+        raw["cleanup"]["views_max_normal_angle"] = bad
+        with pytest.raises(ValueError):
+            Config(**raw)
+
+
+def test_gt_point_seen_from_behind_is_removed(tmp_path):
+    """Same rule for the GT: the normal of a GT point is the vertex normal of the nearest vertex of the
+    GT mesh. GT mesh = the bottom plate alone, so camera A sees the back of every GT point."""
+    from eval3d.pipeline.variant_gt import derive_variant_gt, nearest_vertex_normals
+
+    config_path = _scene(tmp_path)
+    gt_mesh = _plate(-1.0, N_GRID, up=False)
+    gt_mesh.export(tmp_path / "gt" / OBJ / "gt.ply")
+    kit = tmp_path / "kit" / OBJ
+    pcd = np.load(kit / "gt_pcd.npy")
+    bottom = pcd[:, 2] < 0
+    for rel in ["gt_pcd.npy", "attributes/visibility_count.npy", "attributes/curvature_values.npy",
+                "challenges/lambertian.npy", "challenges/excluded.npy"]:
+        np.save(kit / rel, np.load(kit / rel)[bottom])
+    pcd = pcd[bottom]
+    assert (nearest_vertex_normals(pcd, gt_mesh)[:, 2] < -0.99).all()
+
+    sfm_a = _write_override(tmp_path, [("000", "A")], name="above")
+    with pytest.raises(ValueError, match="no GT point"):          # seen by A, but only from behind
+        derive_variant_gt(_variant_config(config_path, sfm_a, "above"), OBJ)
+    sfm_b = _write_override(tmp_path, [("001", "B")], name="below")
+    out = derive_variant_gt(_variant_config(config_path, sfm_b, "below"), OBJ)
+    np.testing.assert_array_equal(np.load(out / "keep.npy"), np.arange(len(pcd)))
+    prov = json.loads((out / "variant_provenance.json").read_text())
+    assert prov["views_max_normal_angle"] == 90.0 and prov["n_undefined_normals"] == 0
+    assert "nearest vertex" in prov["normals"]
+
+    # the threshold is the config's
+    raw = yaml.safe_load(config_path.read_text())
+    raw["cleanup"]["views_max_normal_angle"] = 179.0
+    config_path.write_text(yaml.safe_dump(raw))
+    out = derive_variant_gt(_variant_config(config_path, sfm_a, "above"), OBJ)
+    assert 0.5 * len(pcd) < len(np.load(out / "keep.npy")) < len(pcd)
+
+
+def test_all_evaluation_views_still_remove_what_they_see_only_from_behind(tmp_path):
+    """The control with all the evaluation views is not the default result in general: here the usual
+    cleanup keeps the bottom plate (B sees it), and so does the second step; but with the bottom plate
+    turned inside out (normals up), every view that sees it sees its back, and the second step removes
+    it while the usual cleanup, which has no orientation test, keeps it."""
+    from eval3d.pipeline.cleanup import cleanup_mesh
+
+    config_path = _scene(tmp_path)
+    raw_mesh = tmp_path / "eval" / OBJ / METHOD / "results_raw" / "mesh.ply"
+    trimesh.util.concatenate([_plate(1.01, N_GRID, up=True), _plate(-1.01, N_GRID, up=True)]).export(raw_mesh)
+    base = load_config(config_path)
+    sfm = _write_override(tmp_path, [("000", "A"), ("001", "B")], name="all")
+    cfg = _variant_config(config_path, sfm, "all")
+    cleanup_mesh(cfg, OBJ, METHOD)
+    v1 = _cleaned_vertices(base)
+    assert (v1[:, 2] > 0).any() and (v1[:, 2] < 0).any()        # usual cleanup: both plates
+    v2 = _cleaned_vertices(cfg)
+    assert len(v2) == N_GRID * N_GRID and (v2[:, 2] > 0).all()   # second step: the inside-out plate is gone
+
+
 # --------------------------------------------------------------------------- control: all the evaluation views
 
 
 def test_all_evaluation_views_give_the_default_result(tmp_path):
     """Control: a custom file holding the evaluation views themselves changes nothing here, for the
-    reconstruction and for the GT (every GT point of this scene is seen by them; a published gt_pcd
-    loses a few points at step 3, see test_gt_points_unseen_by_all_the_views_are_removed)."""
+    reconstruction and for the GT, because every vertex and GT point of this scene is seen from its
+    front by one of them. It is not a general property: the second step also removes what the views
+    do not see (test_gt_points_unseen_by_all_the_views_are_removed) or see only from behind
+    (test_all_evaluation_views_still_remove_what_they_see_only_from_behind)."""
     config_path = _scene(tmp_path)
     base = load_config(config_path)
     assert _cli(config_path, "run", "-w", "1").exit_code == 0

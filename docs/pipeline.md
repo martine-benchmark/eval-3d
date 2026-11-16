@@ -71,8 +71,8 @@ Without `--views`, nothing changes. With `--views`, the cleaning is done in two 
    exists).
 2. **Second cleanup of the reconstruction** on the custom views: the same visibility filter
    (`filter_by_visibility`, same dilation) applied to the mesh of step 1 with the cameras and
-   silhouettes of the custom file. Output: `results_cleaned@<tag>/` (`views_provenance.json`
-   records the file and the settings).
+   silhouettes of the custom file, plus an orientation test (below). Output:
+   `results_cleaned@<tag>/` (`views_provenance.json` records the file and the settings).
 3. **Same second cleanup of the GT point cloud**: the same call on the published `gt_pcd.npy`
    (occluder: the GT mesh). Output: `Groundtruth@<tag>/`, with every per-point array of
    `attributes/` and `challenges/` subset by the same mask, `keep.npy` (indices into the published
@@ -80,6 +80,18 @@ Without `--views`, nothing changes. With `--views`, the cleaning is done in two 
    `visibility_count`, keep their values on the full view set.
 4. **Evaluation** of `results_cleaned@<tag>/` against `Groundtruth@<tag>/`. Output:
    `eval_results@<tag>/`.
+
+**The rule of steps 2 and 3.** A point is kept when at least one custom view sees it: inside the
+image and the (dilated) silhouette, not occluded, and **seen from its front**, i.e. the angle
+between the point's normal and the direction from the point to the camera is strictly below
+`cleanup.views_max_normal_angle` degrees (config key, default `90`: `normal . (camera - point) > 0`).
+Without this test a surface seen from behind through a hole would be kept: the inside of a shoe
+seen through its opening, or what lies behind a region removed at step 1. The normals are the
+vertex normals of the step-1 mesh for the reconstruction and, for a GT point, the vertex normal of
+the nearest vertex of the GT mesh (the published kit has no normals). A point whose normal is
+undefined (zero) faces no camera and is removed; the provenance files count them
+(`n_undefined_normals`). The usual cleanup (step 1, and everything without `--views`) has no
+orientation test.
 
 **The custom file.** An SfMData file (`.sfm` or `.json`) in the frame of the evaluation cameras,
 with one view per camera. The silhouette of a view is `<dir of the file>/masks/<stem>.png`, where
@@ -89,7 +101,7 @@ is an error.
 **The tag** is the file name without its extension (`front3.sfm` gives `@front3`); `--variant <tag>`
 sets another one. The files written by `martine-convert subsets --write-eval-sfm` are named for
 this: `<preset>.sfm`, or `views<N>.sfm` for a subset of N views. One tag per view set: an existing `@<tag>` output made from another file or other
-settings is refused, `--force` (on `cleanup` and `preprocess-gt`) rebuilds it.
+settings (dilation, `views_max_normal_angle`) is refused, `--force` (on `cleanup` and `preprocess-gt`) rebuilds it.
 
 **Watertight masks are applied at step 1 only.** They mark the holes of the GT (e.g. the inside of
 a shoe) and only remove vertices of the reconstruction. Step 1 has removed them, so the custom view
