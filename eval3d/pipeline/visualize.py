@@ -63,8 +63,9 @@ def visualize_method(
     - Method mesh only: accuracy, completeness (distance metrics)
     - Both: uniform (plain gray render)
     - Normals (ray cast, both meshes): normals (GT and method normal maps), angular_error
-      (per-pixel angle between them, plus angular_error/mae.json). Excluded regions are gray
-      and out of the MAE in both 'gray' and 'remove' modes (the full meshes are ray cast).
+      (per-pixel angle between them, plus angular_error/mae.json). Excluded regions follow
+      exclude_mode as for the other metrics: 'gray' paints them gray (out of the MAE),
+      'remove' ray casts the meshes with the excluded faces removed.
 
     Args:
         config: Pipeline configuration
@@ -172,9 +173,6 @@ def visualize_method(
         else gt_dir / "challenges" / "excluded.npy"
     gt_excluded_mask = None
     method_excluded_mask = None
-    # The normal metrics ray cast the FULL meshes (before 'remove') and gray the excluded pixels.
-    gt_mesh_full, method_mesh_full = gt_mesh, method_mesh
-    gt_full_excluded = method_full_excluded = None
 
     if exclude_mode != "none" and excluded_npy_path.exists() and gt_pcd is not None:
         print(f"  Loading exclusion mask from {excluded_npy_path.name} (mode={exclude_mode})")
@@ -189,14 +187,12 @@ def visualize_method(
             if gt_mesh is not None:
                 indices = nearest_gt.query(gt_mesh.vertices)
                 keep_mask = ~excluded_pcd[indices].astype(bool)
-                gt_full_excluded = ~keep_mask
                 n_before = len(gt_mesh.vertices)
                 gt_mesh = filter_mesh_by_vertex_mask(gt_mesh, keep_mask)
                 print(f"  Removed excluded from GT mesh: {n_before} -> {len(gt_mesh.vertices)} vertices")
             if method_mesh is not None:
                 indices = nearest_gt.query(method_mesh.vertices)
                 keep_mask = ~excluded_pcd[indices].astype(bool)
-                method_full_excluded = ~keep_mask
                 n_before = len(method_mesh.vertices)
                 method_mesh = filter_mesh_by_vertex_mask(method_mesh, keep_mask)
                 print(f"  Removed excluded from method mesh: {n_before} -> {len(method_mesh.vertices)} vertices")
@@ -209,8 +205,6 @@ def visualize_method(
             if method_mesh is not None:
                 indices = nearest_gt.query(method_mesh.vertices)
                 method_excluded_mask = excluded_pcd[indices]
-            gt_full_excluded = None if gt_excluded_mask is None else gt_excluded_mask.astype(bool)
-            method_full_excluded = None if method_excluded_mask is None else method_excluded_mask.astype(bool)
 
     print(f"Visualizing: {object_name}/{method_name} (exclude_mode={exclude_mode})")
     if method_mesh:
@@ -515,15 +509,15 @@ def visualize_method(
 
     if set(metrics) & NORMAL_METRICS:
         results.update(visualize_normals(
-            gt_mesh_full, method_mesh_full, cameras, view_indices,
+            gt_mesh, method_mesh, cameras, view_indices,
             metrics=[m for m in metrics if m in NORMAL_METRICS],
             gt_out=gt_vis_dir / "normals",
             method_out=vis_dir / "normals",
             error_out=vis_dir / "angular_error",
             scale=scale,
             crop_bboxes=crop_bboxes if crop else None,
-            gt_excluded=gt_full_excluded,
-            method_excluded=method_full_excluded,
+            gt_excluded=None if gt_excluded_mask is None else np.asarray(gt_excluded_mask, dtype=bool),
+            method_excluded=None if method_excluded_mask is None else np.asarray(method_excluded_mask, dtype=bool),
             cmap=colormaps.get("angular_error", "viridis"),
             integrated_colorbar=integrated_colorbar,
             force=force,
@@ -572,9 +566,10 @@ def visualize_normals(
     Both meshes are ray cast through the same pixel centres (full image at ``scale``, restricted to
     the crop bbox of the view when given), so the maps overlap pixel for pixel and with the other
     renders cropped by the same bbox. The MAE is computed at that resolution, before downsizing.
-    Pixels are excluded when the GT hit (or, with no GT hit, the method hit) lands on an excluded
-    vertex (``*_excluded``: per-vertex booleans of the meshes given); they are gray in all three
-    maps and out of the MAE, as the pixels seen by one mesh only (light gray in the error map).
+    With ``*_excluded`` (per-vertex booleans of the meshes given, exclude_mode 'gray'), pixels whose
+    GT hit (or, with no GT hit, method hit) lands on an excluded vertex are gray in all three maps
+    and out of the MAE. For 'remove', pass the meshes with the excluded faces already removed and
+    no flags. Pixels seen by one mesh only are out of the MAE (light gray in the error map).
     """
     import time
 

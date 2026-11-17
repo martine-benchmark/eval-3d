@@ -46,8 +46,9 @@ def workspace(tmp_path, monkeypatch):
     cams = load_cameras_auto(config.get_cameras_path("lego"))
     H, W = cams["image_height"], cams["image_width"]
     bboxes = {str(v): [100, H - 101, 150, W - 151] for v in VIEWS}
-    (gt_dir / "visualizations").mkdir()
-    (gt_dir / "visualizations" / "bbox.json").write_text(json.dumps(bboxes))
+    for d in ("visualizations", "visualizations_remove"):
+        (gt_dir / d).mkdir()
+        (gt_dir / d / "bbox.json").write_text(json.dumps(bboxes))
     return config, tmp_path, (H - 200, W - 300)
 
 
@@ -108,3 +109,26 @@ def test_perturbed_reconstruction_has_positive_mae(workspace):
     _run(config)
     mae = json.loads((config.get_method_dir("lego", "m") / "visualizations" / "angular_error" / "mae.json").read_text())
     assert mae["cell"]["mae_deg"] > 1.0
+
+
+def test_remove_mode_drops_excluded_faces_like_the_other_metrics(workspace):
+    """--exclude-mode remove: the excluded faces are removed from both meshes before ray casting, as for
+    accuracy/completeness (no gray); 'gray' keeps them and paints them gray."""
+    config, tmp_path, _ = workspace
+    gt_pcd = np.load(FIXTURE / "gt" / "gt_pcd.npy")
+    np.save(tmp_path / "excluded.npy", gt_pcd[:, 0] > np.median(gt_pcd[:, 0]))
+    m_vis = config.get_method_dir("lego", "m")
+    _run(config, exclude_mode="gray", excluded_override_path=tmp_path / "excluded.npy")
+    gray = json.loads((m_vis / "visualizations" / "angular_error" / "mae.json").read_text())["views"][str(VIEWS[0])]
+    _run(config, exclude_mode="remove", excluded_override_path=tmp_path / "excluded.npy")
+    vis = m_vis / "visualizations_remove"
+    rem = json.loads((vis / "angular_error" / "mae.json").read_text())
+    s = rem["views"][str(VIEWS[0])]
+    assert rem["exclude_mode"] == "remove"
+    assert s["n_excluded"] == 0
+    # The removed surface no longer hides anything: fewer GT pixels than gray's non-excluded + excluded
+    assert s["n_gt"] < gray["n_gt"] + gray["n_excluded"]
+    gt_vis = config.get_gt_dir("lego") / "visualizations_remove"
+    for png in (gt_vis / "normals" / f"view_{VIEWS[0]:03d}.png", vis / "normals" / f"view_{VIEWS[0]:03d}.png",
+                vis / "angular_error" / f"view_{VIEWS[0]:03d}.png"):
+        assert not (np.array(Image.open(png)) == EXCLUDED_RGB).all(axis=-1).any(), png
