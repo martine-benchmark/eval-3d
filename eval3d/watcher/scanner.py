@@ -14,11 +14,14 @@ from ..config import Config, load_config
 logger = logging.getLogger(__name__)
 
 
-def wrap_command(cmd: str, venv_path: Path, setup_script: Optional[str] = None) -> str:
+def wrap_command(cmd: str, venv_path: Optional[Path], setup_script: Optional[str] = None) -> str:
     """Shell line for a SLURM job: source the machine setup script (if any), select the headless
-    OSMesa backend, activate the virtualenv, then run *cmd*."""
+    OSMesa backend, activate the virtualenv (if any), then run *cmd*."""
     parts = [f"source {shlex.quote(str(setup_script))}"] if setup_script else []
-    parts += ["export PYOPENGL_PLATFORM=osmesa", f"source {venv_path / 'bin' / 'activate'}", cmd]
+    parts.append("export PYOPENGL_PLATFORM=osmesa")
+    if venv_path is not None:
+        parts.append(f"source {venv_path / 'bin' / 'activate'}")
+    parts.append(cmd)
     return " && ".join(parts)
 
 
