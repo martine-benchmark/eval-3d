@@ -223,8 +223,8 @@ def run(ctx, object_name, method_name, workers, slurm, stages, views, variant):
 
     stages = list(stages)
 
-    if config.is_variant and "evaluate" in stages:
-        # The GT of the custom views, once per object, before the per-method jobs.
+    if config.is_variant and "evaluate" in stages and not slurm:
+        # The GT of the custom views, once per object, before the per-method jobs (with --slurm: a job per object).
         from .pipeline.variant_gt import derive_variant_gt
         for obj in [object_name] if object_name else config.dataset.objects:
             derive_variant_gt(config, obj)

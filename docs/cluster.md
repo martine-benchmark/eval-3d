@@ -17,6 +17,7 @@ copy `config/setup_env.example.sh` to `config/setup_env.local.sh` (git-ignored) 
 Dispatch the whole flow with `run --slurm`, or submit individual stages. `run --slurm` submits one
 `cleanup` job and one `evaluate` job (after it) per object and method, then waits for them; the jobs
 activate the virtualenv that submitted them, the scripts go to `<output_root>/slurm_scripts/` and
-the logs to `<output_root>/slurm_logs/`. It reads the templates from the source tree, so it needs
+the logs to `<output_root>/slurm_logs/`. With `--views`, one more job per object derives `Groundtruth@<tag>` and the `evaluate` jobs wait for
+it too; scripts and logs go to `slurm_scripts@<tag>/` and `slurm_logs@<tag>/`. It reads the templates from the source tree, so it needs
 an editable install (`pip install -e .`). `watch` polls for new
 meshes and submits jobs as they appear; `watch-status` reports on them.
