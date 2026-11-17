@@ -6,7 +6,8 @@ with the same call as the second cleaning step of the reconstruction, `filter_by
 silhouettes, same dilation, same orientation test, no watertight masks; a point inside a view's
 image but outside its dilated mask is removed (silhouette carving), the others are kept if at least
 one view sees them unoccluded (ray casting on the GT mesh) and from their front (the normal of a GT
-point is the vertex normal of the nearest vertex of the GT mesh).
+point is the vertex normal of the nearest vertex of the GT mesh, negated when the orientation check
+of the usual cleanup finds the mesh normals inward).
 Every per-point array of the kit (`gt_pcd.npy`, `attributes/*.npy`, `challenges/*.npy`, exclusion
 masks included) is indexed by the same keep mask, so the attributes stay aligned; the other files of
 the kit's scoring subtrees are copied. The result is written to `Groundtruth@<tag>/` with `keep.npy`
@@ -81,6 +82,26 @@ def nearest_vertex_normals(points: np.ndarray, mesh) -> np.ndarray:
 
 def count_undefined_normals(normals: np.ndarray) -> int:
     return int((np.linalg.norm(normals, axis=1) == 0.0).sum())
+
+
+def orient_normals(normals: np.ndarray, mesh, cameras: dict, what: str) -> tuple[np.ndarray, dict]:
+    """Negate ``normals`` (taken from ``mesh``) when the orientation check of the usual cleanup
+    (`detect_normal_flip`: samples seen from camera 0 of ``cameras``) finds the mesh normals
+    inward. Returns the normals to use and what goes in the provenance."""
+    from ..core.visibility import detect_normal_flip
+
+    d = detect_normal_flip(mesh, cameras)
+    frac = "n/a" if d["front_fraction"] is None else f"{d['front_fraction']:.3f}"
+    print(f"  Normals of the {what}: front-facing fraction (cam0 samples)={frac} "
+          f"({d['n_front']}/{d['n_total']}), flip={d['flip']}")
+    if d["flip"]:
+        print(f"  WARNING: the normals of the {what} point inward: flipped for the orientation test")
+        normals = -normals
+    return normals, {
+        "normals_flipped": d["flip"],
+        "front_facing_fraction": d["front_fraction"],
+        "front_facing_samples": d["n_total"],
+    }
 
 
 def _kit_layout(base: Path, n_base: int) -> tuple[list[str], list[str], list[str]]:
@@ -203,7 +224,7 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
     print(f"  Occluder: {len(mesh.vertices):,} vertices, {len(mesh.faces):,} faces")
 
     # Same call as the second cleaning step of the reconstruction, on the GT points.
-    normals = nearest_vertex_normals(gt_pcd, mesh)
+    normals, orientation = orient_normals(nearest_vertex_normals(gt_pcd, mesh), mesh, cameras, "GT mesh")
     keep = filter_by_visibility(
         gt_pcd, mesh, cameras, masks_dir,
         dilation_radius=c.dilation_radius,
@@ -249,6 +270,7 @@ def derive_variant_gt(config, object_name: str, force: bool = False) -> Path:
             "occluder_mesh": mesh_paths,
             "normals": "vertex normal of the nearest vertex of the occluder mesh",
             "n_undefined_normals": count_undefined_normals(normals),
+            **orientation,
             "n_base": n_base,
             "n_kept": n_kept,
             "kept_fraction": n_kept / n_base,

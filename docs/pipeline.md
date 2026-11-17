@@ -89,6 +89,11 @@ Without this test a surface seen from behind through a hole would be kept: the i
 seen through its opening, or what lies behind a region removed at step 1. The normals are the
 vertex normals of the step-1 mesh for the reconstruction and, for a GT point, the vertex normal of
 the nearest vertex of the GT mesh (the published kit has no normals). A point whose normal is
+Normals pointing inward (a mesh whose faces are all inverted) are detected and negated first, with
+the orientation check that the usual cleanup applies before its watertight culling: surface samples
+seen from the first view of the file, flipped when fewer than half face it. The fraction and the
+decision are printed and recorded in the provenance files (`front_facing_fraction`,
+`normals_flipped`). The check is global: a partly inverted mesh is not repaired. A point whose normal is
 undefined (zero) faces no camera and is removed; the provenance files count them
 (`n_undefined_normals`). The usual cleanup (step 1, and everything without `--views`) has no
 orientation test.

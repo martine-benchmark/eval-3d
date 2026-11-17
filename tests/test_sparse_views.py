@@ -556,13 +556,24 @@ def test_facing_camera_threshold():
     np.testing.assert_array_equal(facing_camera(pts, normals, cam, 150.0), [True, True, True, True, True])
 
 
+def _holed_plates(dz=0.0):
+    """The two plates, the top one with a strip missing (a fifth of it): through that hole, camera A
+    (above) sees the back of the bottom plate. Most of what A sees is still a front side, so the
+    global orientation check does not take the mesh for an inverted one."""
+    top = _plate(1.0 + dz, N_GRID, up=True)
+    top.update_faces(top.triangles_center[:, 0] > -0.6)
+    top.remove_unreferenced_vertices()
+    return trimesh.util.concatenate([top, _plate(-1.0 - dz, N_GRID, up=False)])
+
+
 def _holed_scene(tmp_path):
-    """Default watertight masks, white for view 000 only: step 1 removes the top plate (what camera A
-    sees from its front). Through that hole, A then sees the back of the bottom plate."""
     config_path = _scene(tmp_path)
-    _write_masks(tmp_path / "gt" / OBJ / "masks_watertight", ["000"])
-    _write_masks(tmp_path / "gt" / OBJ / "masks_watertight", ["001"], value=0)
+    _holed_plates(dz=0.01).export(tmp_path / "eval" / OBJ / METHOD / "results_raw" / "mesh.ply")
     return config_path
+
+
+def _bottom(vertices):
+    return vertices[vertices[:, 2] < 0]
 
 
 def test_vertex_seen_from_behind_through_a_hole_is_removed(tmp_path):
@@ -574,22 +585,25 @@ def test_vertex_seen_from_behind_through_a_hole_is_removed(tmp_path):
     cfg_a = _variant_config(config_path, sfm_a, "above")
     cleanup_mesh(cfg_a, OBJ, METHOD)
     step1 = trimesh.load(base.get_cleaned_mesh_path(OBJ, METHOD), process=False, force="mesh")
-    assert len(step1.vertices) and (step1.vertices[:, 2] < 0).all()        # the bottom plate, holed above
-    # A sees it unoccluded...
+    n_top = int((step1.vertices[:, 2] > 0).sum())
+    assert n_top and len(_bottom(step1.vertices)) == N_GRID * N_GRID      # the usual cleanup keeps both
+    # A sees a part of the bottom plate unoccluded, through the hole...
     seen = filter_by_visibility(step1.vertices, step1, load_cameras_auto(sfm_a), sfm_a.parent / "masks",
                                 dilation_radius="auto", show_progress=False, dilation_ref_px=4,
                                 dilation_ref_n_pixels=W * H)
-    assert seen.all()
-    # ... but from behind: nothing is kept
-    assert len(_cleaned_vertices(cfg_a)) == 0
+    assert (seen & (step1.vertices[:, 2] < 0)).sum() > 20
+    # ... but from behind: only the top plate is kept
+    kept = _cleaned_vertices(cfg_a)
+    assert len(kept) == n_top and len(_bottom(kept)) == 0
     prov = json.loads((cfg_a.get_cleaned_mesh_path(OBJ, METHOD).parent / "views_provenance.json").read_text())
-    assert prov["views_max_normal_angle"] == 90.0 and prov["n_kept_vertices"] == 0
+    assert prov["views_max_normal_angle"] == 90.0 and prov["normals_flipped"] is False
+    assert 0.5 < prov["front_facing_fraction"] < 1.0
 
-    # a view on the other side sees the same vertices from their front: kept
+    # a view on the other side sees the bottom plate from its front: kept
     sfm_b = _write_override(tmp_path, [("001", "B")], name="below")
     cfg_b = _variant_config(config_path, sfm_b, "below")
     cleanup_mesh(cfg_b, OBJ, METHOD)
-    assert len(_cleaned_vertices(cfg_b)) == len(step1.vertices)
+    assert len(_bottom(_cleaned_vertices(cfg_b))) == N_GRID * N_GRID
 
 
 def test_orientation_threshold_is_read_from_the_config(tmp_path):
@@ -603,10 +617,8 @@ def test_orientation_threshold_is_read_from_the_config(tmp_path):
     cfg = _variant_config(config_path, sfm, "above")
     assert cfg.cleanup.views_max_normal_angle == 179.0
     cleanup_mesh(cfg, OBJ, METHOD)
-    kept = _cleaned_vertices(cfg)
-    step1 = trimesh.load(load_config(config_path).get_cleaned_mesh_path(OBJ, METHOD), process=False, force="mesh")
-    # seen from behind at 171 to 180 degrees: kept below 179, the few vertices right under the camera are not
-    assert 0.5 * len(step1.vertices) < len(kept) < len(step1.vertices)
+    # the bottom plate under the hole is seen from behind at 171 to 180 degrees: kept below 179
+    assert len(_bottom(_cleaned_vertices(cfg))) > 20
     prov_path = cfg.get_cleaned_mesh_path(OBJ, METHOD).parent / "views_provenance.json"
     assert json.loads(prov_path.read_text())["views_max_normal_angle"] == 179.0
 
@@ -617,7 +629,7 @@ def test_orientation_threshold_is_read_from_the_config(tmp_path):
     with pytest.raises(ValueError, match="views_max_normal_angle"):
         cleanup_mesh(strict, OBJ, METHOD)
     cleanup_mesh(strict, OBJ, METHOD, force=True)
-    assert len(_cleaned_vertices(strict)) == 0
+    assert len(_bottom(_cleaned_vertices(strict))) == 0
 
     for bad in (0.0, -10.0, 181.0):
         raw["cleanup"]["views_max_normal_angle"] = bad
@@ -627,11 +639,12 @@ def test_orientation_threshold_is_read_from_the_config(tmp_path):
 
 def test_gt_point_seen_from_behind_is_removed(tmp_path):
     """Same rule for the GT: the normal of a GT point is the vertex normal of the nearest vertex of the
-    GT mesh. GT mesh = the bottom plate alone, so camera A sees the back of every GT point."""
+    GT mesh. GT mesh = the plates with the hole, GT points = the bottom plate only: camera A sees some
+    of them, through the hole, and only from behind."""
     from eval3d.pipeline.variant_gt import derive_variant_gt, nearest_vertex_normals
 
     config_path = _scene(tmp_path)
-    gt_mesh = _plate(-1.0, N_GRID, up=False)
+    gt_mesh = _holed_plates()
     gt_mesh.export(tmp_path / "gt" / OBJ / "gt.ply")
     kit = tmp_path / "kit" / OBJ
     pcd = np.load(kit / "gt_pcd.npy")
@@ -650,14 +663,69 @@ def test_gt_point_seen_from_behind_is_removed(tmp_path):
     np.testing.assert_array_equal(np.load(out / "keep.npy"), np.arange(len(pcd)))
     prov = json.loads((out / "variant_provenance.json").read_text())
     assert prov["views_max_normal_angle"] == 90.0 and prov["n_undefined_normals"] == 0
-    assert "nearest vertex" in prov["normals"]
+    assert "nearest vertex" in prov["normals"] and prov["normals_flipped"] is False
 
     # the threshold is the config's
     raw = yaml.safe_load(config_path.read_text())
     raw["cleanup"]["views_max_normal_angle"] = 179.0
     config_path.write_text(yaml.safe_dump(raw))
     out = derive_variant_gt(_variant_config(config_path, sfm_a, "above"), OBJ)
-    assert 0.5 * len(pcd) < len(np.load(out / "keep.npy")) < len(pcd)
+    assert 20 < len(np.load(out / "keep.npy")) < len(pcd)
+
+
+def test_surface_seen_only_from_behind_is_taken_for_an_inverted_mesh(tmp_path):
+    """Limit of the global orientation check, as in the usual cleanup: when the first view sees only
+    back sides (here the bottom plate alone, from above), the normals are taken for inward ones and
+    negated, and what the view sees is kept."""
+    mesh, cams, masks = _bottom_plate_seen_from_above(tmp_path)
+    from eval3d.core.visibility import detect_normal_flip
+
+    d = detect_normal_flip(mesh, _one_camera(cams, 0))
+    assert d["flip"] is True and d["front_fraction"] == 0.0
+    assert detect_normal_flip(mesh, _one_camera(cams, 1))["flip"] is False
+
+
+def _inverted(path):
+    mesh = trimesh.load(path, process=False, force="mesh")
+    trimesh.Trimesh(mesh.vertices, mesh.faces[:, ::-1], process=False).export(path)
+
+
+def test_mesh_with_all_faces_inverted_keeps_the_same_points(tmp_path):
+    """Inward normals are detected (orientation check of the usual cleanup) and negated before the
+    orientation test: same kept vertices and same kept GT points as with the mesh the right way round."""
+    from eval3d.core.visibility import detect_normal_flip
+    from eval3d.pipeline.cleanup import cleanup_mesh
+    from eval3d.pipeline.variant_gt import derive_variant_gt
+
+    kept, keep_gt, prov = {}, {}, {}
+    for name in ("straight", "inverted"):
+        root = tmp_path / name
+        root.mkdir()
+        config_path = _scene(root)
+        if name == "inverted":
+            _inverted(root / "eval" / OBJ / METHOD / "results_raw" / "mesh.ply")
+            _inverted(root / "gt" / OBJ / "gt.ply")
+        sfm = _write_override(root, [("000", "A")], name="above")
+        cfg = _variant_config(config_path, sfm, "above")
+        cleanup_mesh(cfg, OBJ, METHOD)
+        kept[name] = _cleaned_vertices(cfg)
+        out = derive_variant_gt(cfg, OBJ)
+        keep_gt[name] = np.load(out / "keep.npy")
+        prov[name] = (
+            json.loads((cfg.get_cleaned_mesh_path(OBJ, METHOD).parent / "views_provenance.json").read_text()),
+            json.loads((out / "variant_provenance.json").read_text()),
+        )
+        step1 = trimesh.load(load_config(config_path).get_cleaned_mesh_path(OBJ, METHOD), process=False, force="mesh")
+        assert detect_normal_flip(step1, load_cameras_auto(sfm))["flip"] is (name == "inverted")
+
+    assert len(kept["straight"]) == N_GRID * N_GRID                 # the top plate, seen from its front by A
+    np.testing.assert_array_equal(kept["inverted"], kept["straight"])
+    assert len(keep_gt["straight"]) > 0
+    np.testing.assert_array_equal(keep_gt["inverted"], keep_gt["straight"])
+    for p in prov["straight"]:
+        assert p["normals_flipped"] is False and p["front_facing_fraction"] == 1.0
+    for p in prov["inverted"]:
+        assert p["normals_flipped"] is True and p["front_facing_fraction"] == 0.0
 
 
 def test_all_evaluation_views_still_remove_what_they_see_only_from_behind(tmp_path):

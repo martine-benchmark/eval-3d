@@ -7,7 +7,7 @@ from ..config import Config
 from ..core.camera import load_cameras_auto
 from ..core.mesh import filter_mesh_by_vertex_mask, load_mesh, save_mesh
 from ..core.visibility import filter_by_issue_watertight, filter_by_visibility
-from .variant_gt import count_undefined_normals, require_view_masks, visibility_settings
+from .variant_gt import count_undefined_normals, orient_normals, require_view_masks, visibility_settings
 
 
 def cleanup_mesh(
@@ -149,7 +149,9 @@ def cleanup_mesh_views(
        No watertight masks here: they only remove vertices, and step 1 has applied them.
        A view counts for a vertex only if it sees it from its front (vertex normals of the step-1
        mesh, `cleanup.views_max_normal_angle`): step 1 has opened holes in the mesh, and a surface
-       seen from behind through them is not kept.
+       seen from behind through them is not kept. Inward normals (a mesh with all its faces
+       inverted) are detected and negated first, with the orientation check of step 1
+       (`detect_normal_flip`).
 
     `force` rebuilds step 2 only.
     """
@@ -188,6 +190,7 @@ def cleanup_mesh_views(
         import trimesh
         save_mesh(trimesh.Trimesh(), out_path)
         views, n_kept, n_undefined = [], 0, 0
+        orientation = {"normals_flipped": False, "front_facing_fraction": None, "front_facing_samples": 0}
     else:
         cameras = load_cameras_auto(views_path)
         require_view_masks(cameras, masks_dir)
@@ -195,6 +198,7 @@ def cleanup_mesh_views(
         print(f"  {len(views)} view(s): {', '.join(views)}")
         normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
         n_undefined = count_undefined_normals(normals)
+        normals, orientation = orient_normals(normals, mesh, cameras, "cleaned mesh")
         keep_mask = filter_by_visibility(
             mesh.vertices,
             mesh,
@@ -225,5 +229,6 @@ def cleanup_mesh_views(
         "n_kept_vertices": n_kept,
         "normals": "vertex normals of the source mesh",
         "n_undefined_normals": n_undefined,
+        **orientation,
     }, indent=2))
     print(f"  Saved: {out_path}")
