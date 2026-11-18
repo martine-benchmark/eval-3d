@@ -62,6 +62,10 @@ def visualize_method(
     - GT mesh only: visibility, curvature (GT attributes)
     - Method mesh only: accuracy, completeness (distance metrics)
     - Both: uniform (plain gray render)
+    - Normals (ray cast, both meshes): normals (GT and method normal maps), angular_error
+      (per-pixel angle between them, plus angular_error/mae.json). Excluded regions follow
+      exclude_mode as for the other metrics: 'gray' paints them gray (out of the MAE),
+      'remove' ray casts the meshes with the excluded faces removed.
 
     Args:
         config: Pipeline configuration
@@ -95,6 +99,7 @@ def visualize_method(
     GT_ONLY_METRICS = {"visibility", "curvature"}
     METHOD_ONLY_METRICS = {"accuracy", "completeness"}
     BOTH_METRICS = {"uniform"}
+    NORMAL_METRICS = {"normals", "angular_error"}
 
     # Get paths
     method_dir = config.get_method_dir(object_name, method_name)
@@ -139,7 +144,7 @@ def visualize_method(
     cameras = load_cameras_auto(cameras_path)
 
     # Load meshes (only load method mesh if needed by requested metrics)
-    needs_method_mesh = bool(set(metrics) & (METHOD_ONLY_METRICS | BOTH_METRICS))
+    needs_method_mesh = bool(set(metrics) & (METHOD_ONLY_METRICS | BOTH_METRICS | NORMAL_METRICS))
     method_mesh = None
     if needs_method_mesh and cleaned_mesh_path.exists():
         method_mesh = load_mesh(cleaned_mesh_path)
@@ -264,6 +269,8 @@ def visualize_method(
             output_dir = vis_dir / metric
         elif metric in BOTH_METRICS:
             pass  # Handled specially below
+        elif metric in NORMAL_METRICS:
+            continue  # Handled once for both metrics after this loop
         else:
             print(f"  Unknown metric: {metric}")
             continue
@@ -500,4 +507,185 @@ def visualize_method(
         results[metric] = paths
         print(f"    Generated {len(paths)} images")
 
+    if set(metrics) & NORMAL_METRICS:
+        results.update(visualize_normals(
+            gt_mesh, method_mesh, cameras, view_indices,
+            metrics=[m for m in metrics if m in NORMAL_METRICS],
+            gt_out=gt_vis_dir / "normals",
+            method_out=vis_dir / "normals",
+            error_out=vis_dir / "angular_error",
+            scale=scale,
+            crop_bboxes=crop_bboxes if crop else None,
+            gt_excluded=None if gt_excluded_mask is None else np.asarray(gt_excluded_mask, dtype=bool),
+            method_excluded=None if method_excluded_mask is None else np.asarray(method_excluded_mask, dtype=bool),
+            cmap=colormaps.get("angular_error", "viridis"),
+            integrated_colorbar=integrated_colorbar,
+            force=force,
+            info={"object": object_name, "method": method_name, "exclude_mode": exclude_mode},
+        ))
+
     return results
+
+
+def _fit(image: np.ndarray, max_resolution: int | None) -> np.ndarray:
+    """Downsize like render_views (longest side <= max_resolution, LANCZOS)."""
+    h, w = image.shape[:2]
+    if max_resolution is None or max(h, w) <= max_resolution:
+        return image
+    ratio = max_resolution / max(h, w)
+    return np.array(Image.fromarray(image).resize((int(w * ratio), int(h * ratio)), Image.LANCZOS))
+
+
+def _save_png(image: np.ndarray, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(image).save(path)
+    return path
+
+
+def visualize_normals(
+    gt_mesh: trimesh.Trimesh | None,
+    method_mesh: trimesh.Trimesh | None,
+    cameras: dict,
+    view_indices: list[int],
+    metrics: list[str],
+    gt_out: Path,
+    method_out: Path,
+    error_out: Path,
+    scale: float = 1.0,
+    crop_bboxes: dict[int, tuple[int, int, int, int]] | None = None,
+    gt_excluded: np.ndarray | None = None,
+    method_excluded: np.ndarray | None = None,
+    cmap: str = "viridis",
+    integrated_colorbar: bool = False,
+    force: bool = False,
+    max_resolution: int | None = 1000,
+    info: dict | None = None,
+) -> dict:
+    """GT / method normal maps (``normals``), angular-error maps and mae.json (``angular_error``).
+
+    Both meshes are ray cast through the same pixel centres (full image at ``scale``, restricted to
+    the crop bbox of the view when given), so the maps overlap pixel for pixel and with the other
+    renders cropped by the same bbox. The MAE is computed at that resolution, before downsizing.
+    With ``*_excluded`` (per-vertex booleans of the meshes given, exclude_mode 'gray'), pixels whose
+    GT hit (or, with no GT hit, method hit) lands on an excluded vertex are gray in all three maps
+    and out of the MAE. For 'remove', pass the meshes with the excluded faces already removed and
+    no flags. Pixels seen by one mesh only are out of the MAE (light gray in the error map).
+    """
+    import time
+
+    from ..core.camera import PIXEL_CENTRE_TRUNCATE
+    from ..core.normals import (
+        ANGULAR_ERROR_MAX_DEG,
+        NormalRenderer,
+        angular_error_deg,
+        color_angular_error,
+        encode_normals_rgb,
+        normal_error_stats,
+        pixel_categories,
+        scale_intrinsics,
+    )
+    from ..core.rendering import _BG
+
+    if gt_mesh is None or method_mesh is None:
+        print("  Skipping normals/angular_error: " + ("GT" if gt_mesh is None else "method") + " mesh not found")
+        return {}
+    want_normals = "normals" in metrics
+    want_error = "angular_error" in metrics
+    mae_path = error_out / "mae.json"
+    names = [f"view_{v:03d}.png" for v in view_indices]
+    done = (not want_error or mae_path.exists()) and (
+        not want_normals or all((d / n).exists() for d in (gt_out, method_out) for n in names))
+    if done and not force:
+        print("  normals/angular_error: already exist, skipping")
+        out = {}
+        if want_normals:
+            out["normals_gt"] = [gt_out / n for n in names]
+            out["normals_method"] = [method_out / n for n in names]
+        if want_error:
+            out["angular_error"] = [error_out / n for n in names]
+        return out
+
+    bg = tuple(int(round(c * 255)) for c in _BG[:3])
+    pixel_centre = cameras.get("pixel_centre", PIXEL_CENTRE_TRUNCATE)
+    H = int(cameras["image_height"] * scale)
+    W = int(cameras["image_width"] * scale)
+    print(f"  Ray casting normals at {W}x{H} (scale={scale}, pixel centre {pixel_centre})")
+    t0 = time.perf_counter()
+    gt_r, rec_r = NormalRenderer(gt_mesh), NormalRenderer(method_mesh)
+    t_build = time.perf_counter() - t0
+
+    out = {"normals_gt": [], "normals_method": [], "angular_error": []}
+    per_view = {}
+    colorbar_params = None
+    for idx, name in zip(view_indices, names):
+        t0 = time.perf_counter()
+        K = scale_intrinsics(cameras["K"][idx], scale, pixel_centre)
+        bbox = crop_bboxes.get(idx) if crop_bboxes else None
+        g = gt_r.render(K, cameras["Rt"][idx], (H, W), pixel_centre=pixel_centre, bbox=bbox)
+        r = rec_r.render(K, cameras["Rt"][idx], (H, W), pixel_centre=pixel_centre, bbox=bbox)
+
+        excluded = np.zeros(g.mask.shape, dtype=bool)
+        if gt_excluded is not None:
+            excluded[g.mask] = gt_excluded[g.nearest_vertex[g.mask]]
+        if method_excluded is not None:
+            only_rec = r.mask & ~g.mask
+            excluded[only_rec] = method_excluded[r.nearest_vertex[only_rec]]
+
+        err = angular_error_deg(g.normals, r.normals)
+        cat = pixel_categories(g.mask, r.mask, excluded)
+        stats = normal_error_stats(err, cat, g.mask, excluded)
+        valid = cat["valid"]
+        stats["gt_back_facing"] = float((g.facing[valid] < 0).mean()) if valid.any() else float("nan")
+        stats["method_back_facing"] = float((r.facing[valid] < 0).mean()) if valid.any() else float("nan")
+        stats["window"] = [int(x) for x in (bbox if bbox is not None else (0, H - 1, 0, W - 1))]
+        stats["time_s"] = round(time.perf_counter() - t0, 2)
+        per_view[str(idx)] = stats
+
+        if want_normals:
+            out["normals_gt"].append(_save_png(
+                _fit(encode_normals_rgb(g.normals, g.mask, bg, excluded), max_resolution), gt_out / name))
+            out["normals_method"].append(_save_png(
+                _fit(encode_normals_rgb(r.normals, r.mask, bg, excluded), max_resolution), method_out / name))
+        if want_error:
+            rgb, colorbar_params = color_angular_error(err, cat, cmap=cmap, background=bg)
+            path = _save_png(_fit(rgb, max_resolution), error_out / name)
+            out["angular_error"].append(path)
+            if integrated_colorbar:
+                composite = add_colorbar(
+                    np.array(Image.open(path).convert("RGB")), colorbar_params["vmin"], colorbar_params["vmax"],
+                    colorbar_params["cmap"], colorbar_params["label"], position="right", reserve_label_space=True)
+                _save_png(composite, path.with_name(f"{path.stem}_cb.png"))
+        print(f"    view {idx}: MAE {stats['mae_deg']:.2f} deg over {stats['n_valid']} px "
+              f"(GT coverage {stats['gt_coverage']:.3f}), {stats['time_s']} s")
+
+    if want_error:
+        if colorbar_params is not None and not integrated_colorbar:
+            with_cb = add_colorbar(np.full((100, 100, 3), 255, dtype=np.uint8), colorbar_params["vmin"],
+                                   colorbar_params["vmax"], colorbar_params["cmap"], colorbar_params["label"])
+            _save_png(with_cb[:, 100:], error_out / "colorbar.png")
+        n = np.array([s["n_valid"] for s in per_view.values()], dtype=float)
+        maes = np.array([s["mae_deg"] for s in per_view.values()], dtype=float)
+        ok = n > 0
+        summary = {
+            **(info or {}),
+            "definition": "per-pixel angle between the ray-cast GT and method normal maps (interpolated vertex "
+                          "normals), over the pixels seen by both meshes and not excluded",
+            "vmax_deg": ANGULAR_ERROR_MAX_DEG,
+            "scale": scale,
+            "pixel_centre": pixel_centre,
+            "n_faces": {"gt": int(len(gt_mesh.faces)), "method": int(len(method_mesh.faces))},
+            "build_s": round(t_build, 2),
+            "views": per_view,
+            "cell": {
+                "mae_deg": float((maes[ok] * n[ok]).sum() / n[ok].sum()) if ok.any() else float("nan"),
+                "mean_view_mae_deg": float(maes[ok].mean()) if ok.any() else float("nan"),
+                "n_valid": int(n.sum()),
+                "n_views": int(ok.sum()),
+            },
+        }
+        error_out.mkdir(parents=True, exist_ok=True)
+        tmp = mae_path.with_name(f"{mae_path.name}.tmp{os.getpid()}")
+        tmp.write_text(json.dumps(summary, indent=2))
+        os.replace(tmp, mae_path)
+        print(f"    Saved {mae_path} (cell MAE {summary['cell']['mae_deg']:.2f} deg)")
+    return {k: v for k, v in out.items() if v}
