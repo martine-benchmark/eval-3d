@@ -311,6 +311,83 @@ def estimate_normal_flip(
     return oriented_dot_visible_front < 0.5 * oriented_dot_visible_total
 
 
+def count_front_facing_samples(
+    mesh: trimesh.Trimesh,
+    normals: np.ndarray,
+    camera_center: np.ndarray,
+    sample_count: int = 100,
+) -> tuple[int, int]:
+    """Sample up to ``sample_count`` surface points of ``mesh`` that ``camera_center`` sees
+    unoccluded and count those whose normal (vertex normal of the nearest vertex) faces it.
+
+    Returns (n_front, n_total), the tally :func:`estimate_normal_flip` decides on.
+    """
+    sample_points = mesh.sample(max(sample_count * 5, sample_count))
+    valid_samples = []
+    for point in sample_points:
+        if len(valid_samples) >= sample_count:
+            break
+        point = np.asarray(point, dtype=np.float32)
+        if ray_visibility_check(point[None, :], mesh, camera_center)[0]:
+            valid_samples.append(point)
+    if not valid_samples:
+        return 0, 0
+    sp = np.asarray(valid_samples, dtype=np.float32)[:sample_count]
+    sample_normals = normals[mesh.kdtree.query(sp)[1]]
+    cam_dirs = camera_center - sp  # toward camera
+    cam_dirs = cam_dirs / np.maximum(np.linalg.norm(cam_dirs, axis=1, keepdims=True), 1e-10)
+    dots = np.einsum("ij,ij->i", sample_normals, cam_dirs)
+    return int(np.sum(dots > 0)), int(len(dots))
+
+
+def detect_normal_flip(
+    mesh: trimesh.Trimesh,
+    cameras: dict,
+    sample_count: int = 100,
+) -> dict:
+    """The global orientation check of the watertight culling, for other callers: are the
+    vertex normals of ``mesh`` inward?
+
+    Same rule: surface samples seen unoccluded from camera 0 of ``cameras``, and
+    :func:`estimate_normal_flip` on the fraction that faces it. It is a global decision: a
+    partly inverted mesh is not repaired. Returns ``flip``, ``front_fraction`` (None without
+    any visible sample), ``n_front`` and ``n_total``.
+    """
+    n_front, n_total = 0, 0
+    if len(mesh.faces) and len(cameras.get("P", [])):
+        normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
+        normals = normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-10)
+        n_front, n_total = count_front_facing_samples(
+            mesh, normals, get_camera_centers(cameras["Rt"])[0], sample_count)
+    return {
+        "flip": bool(estimate_normal_flip(n_front, n_total)),
+        "front_fraction": (n_front / n_total) if n_total else None,
+        "n_front": n_front,
+        "n_total": n_total,
+    }
+
+
+def facing_camera(
+    points: np.ndarray,
+    normals: np.ndarray,
+    camera_center: np.ndarray,
+    max_angle: float = 90.0,
+) -> np.ndarray:
+    """True where the angle between a point's normal and the direction from the point to the
+    camera is strictly below ``max_angle`` degrees.
+
+    With the default 90, this is ``normal . (camera - point) > 0``. A point whose normal is
+    undefined (zero vector) faces no camera.
+    """
+    normals = np.asarray(normals, dtype=np.float64)
+    to_camera = np.asarray(camera_center, dtype=np.float64) - np.asarray(points, dtype=np.float64)
+    dot = np.einsum("ij,ij->i", normals, to_camera)
+    if max_angle == 90.0:
+        return dot > 0.0
+    norms = np.linalg.norm(normals, axis=1) * np.linalg.norm(to_camera, axis=1)
+    return (norms > 0.0) & (dot > np.cos(np.deg2rad(max_angle)) * norms)
+
+
 def filter_by_visibility(
     vertices: np.ndarray,
     mesh: trimesh.Trimesh,
@@ -321,6 +398,8 @@ def filter_by_visibility(
     use_masks: bool = True,
     dilation_ref_px: int = AUTO_DILATION_REF_PX,
     dilation_ref_n_pixels: int = AUTO_DILATION_REF_N_PIXELS,
+    normals: np.ndarray | None = None,
+    max_normal_angle: float = 90.0,
 ) -> np.ndarray:
     """Create a vertex mask keeping only vertices visible from at least one view.
 
@@ -340,6 +419,11 @@ def filter_by_visibility(
         use_masks: Whether to use 2D masks for filtering.
         dilation_ref_px: Auto-dilation reference radius (pixels at the reference res).
         dilation_ref_n_pixels: Auto-dilation reference resolution (total pixels).
+        normals: Optional point normals, shape (N, 3). When given, a view counts for a
+            point only if it also sees it from its front: the angle between the normal and
+            the direction from the point to the camera is strictly below ``max_normal_angle``
+            (see :func:`facing_camera`). None (default): no orientation test.
+        max_normal_angle: Angle threshold in degrees of that test (90 = front side).
 
     Returns:
         Boolean mask, True for visible vertices, shape (N,).
@@ -473,6 +557,10 @@ def filter_by_visibility(
 
     # A vertex is visible if: not hit (not occluded) AND in mask (or bounds) for that view
     visible_per_view = ~hits_all_views & in_view_all_views
+    if normals is not None:
+        # ... AND seen from its front: a surface seen from behind through a hole does not count.
+        for view_idx in range(n_views):
+            visible_per_view[view_idx] &= facing_camera(vertices, normals, camera_centers[view_idx], max_normal_angle)
     visible_any = visible_per_view.any(axis=0)
 
     # Final mask: passed mask filtering AND visible from at least one view
@@ -555,23 +643,9 @@ def filter_by_issue_watertight(
     #     estimate_normal_flip for the global flip decision. ---
     oriented_normals = normals
     camera_center0 = camera_centers[0]
-    sample_points = mesh.sample(max(sample_count * 5, sample_count))
-    valid_samples = []
-    for point in sample_points:
-        if len(valid_samples) >= sample_count:
-            break
-        point = np.asarray(point, dtype=np.float32)
-        if ray_visibility_check(point[None, :], mesh, camera_center0)[0]:
-            valid_samples.append(point)
+    n_front, n_total = count_front_facing_samples(mesh, normals, camera_center0, sample_count)
 
-    if valid_samples:
-        sp = np.asarray(valid_samples, dtype=np.float32)[:sample_count]
-        sample_normals = normals[mesh.kdtree.query(sp)[1]]
-        cam_dirs = camera_center0 - sp  # toward camera
-        cam_dirs = cam_dirs / np.maximum(np.linalg.norm(cam_dirs, axis=1, keepdims=True), 1e-10)
-        dots = np.einsum("ij,ij->i", sample_normals, cam_dirs)
-        n_front = int(np.sum(dots > 0))
-        n_total = int(len(dots))
+    if n_total:
         flip = estimate_normal_flip(n_front, n_total)
         if show_progress:
             frac = (n_front / n_total) if n_total else float("nan")

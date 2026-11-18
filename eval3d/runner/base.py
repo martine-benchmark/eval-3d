@@ -11,7 +11,7 @@ class Job:
 
     object_name: str
     method_name: str
-    stage: Literal["cleanup", "evaluate"]
+    stage: Literal["cleanup", "evaluate", "variant_gt"]  # variant_gt: per object, no method
     config_path: str
 
 
@@ -55,6 +55,13 @@ class JobRunner(ABC):
         """
         pass
 
+    def submit_variant_gt(self, config, objects: list[str]) -> dict[str, str]:
+        """Jobs deriving the GT of a custom view set, as {object: job id}; the evaluate jobs wait for them.
+
+        Empty by default: the caller derived it already.
+        """
+        return {}
+
     def run_pipeline(
         self,
         config,
@@ -91,6 +98,8 @@ class JobRunner(ABC):
                     job_id = self.submit(job)
                     cleanup_jobs[f"{obj}/{method}/cleanup"] = job_id
 
+        gt_jobs = self.submit_variant_gt(config, objects) if "evaluate" in stages else {}
+
         if "evaluate" in stages:
             for obj in objects:
                 for method in methods:
@@ -102,14 +111,15 @@ class JobRunner(ABC):
                     )
 
                     cleanup_key = f"{obj}/{method}/cleanup"
-                    if cleanup_key in cleanup_jobs:
-                        job_id = self.submit_with_dependency(job, [cleanup_jobs[cleanup_key]])
+                    depends_on = [jobs[key] for jobs, key in ((cleanup_jobs, cleanup_key), (gt_jobs, obj)) if key in jobs]
+                    if depends_on:
+                        job_id = self.submit_with_dependency(job, depends_on)
                     else:
                         job_id = self.submit(job)
 
                     eval_jobs[f"{obj}/{method}/evaluate"] = job_id
 
-        all_jobs = {**cleanup_jobs, **eval_jobs}
+        all_jobs = {**cleanup_jobs, **{f"{obj}/variant_gt": job_id for obj, job_id in gt_jobs.items()}, **eval_jobs}
         results = self.wait(list(all_jobs.values()))
 
         return {desc: results.get(job_id, False) for desc, job_id in all_jobs.items()}

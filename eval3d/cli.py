@@ -22,13 +22,48 @@ def _is_backup_path(path: Path) -> bool:
     return any(marker in part for part in path.parts for marker in _BACKUP_MARKERS)
 
 
+def _absolute_template(path: str) -> str:
+    """Absolute form of a path template (sub-jobs run from another directory)."""
+    p = Path(path).expanduser()
+    return str(p if p.is_absolute() else Path.cwd() / p)
+
+
+def _refuse_variant(config, command: str) -> None:
+    if config.is_variant:
+        raise click.ClickException(
+            f"{command} is not available with a custom view set (--views, variant {config.variant}): it would "
+            "write the default tree or untagged outputs"
+        )
+
+
+_VIEWS_HELP = ("Sparse-view evaluation: SfMData file of a custom view set (silhouettes in <its dir>/masks/, by view "
+               "name). After the usual cleanup, the reconstruction and the GT point cloud are filtered a second time "
+               "by visibility in these views. Outputs: results_cleaned@<tag>/, Groundtruth@<tag>/, "
+               "eval_results@<tag>/.")
+_VARIANT_HELP = "Tag of the --views outputs (default: the file name of --views without its extension)."
+
+
+def _apply_views(config, views, variant) -> None:
+    if views is None:
+        if variant is not None:
+            raise click.UsageError("--variant needs --views")
+        return
+    try:
+        config.apply_views(_absolute_template(views), variant)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
+
+
 @click.group()
 @click.option("--config", "-c", type=click.Path(exists=True), required=True, help="Path to config YAML file")
+@click.option("--views", "views", default=None, help=_VIEWS_HELP + " Also an option of `run`.")
+@click.option("--variant", "variant", default=None, help=_VARIANT_HELP)
 @click.pass_context
-def main(ctx, config):
+def main(ctx, config, views, variant):
     """Evaluation pipeline for 3D reconstruction benchmarks."""
     ctx.ensure_object(dict)
     cfg = load_config(config)
+    _apply_views(cfg, views, variant)
     cfg._config_path = Path(config)
     ctx.obj["config"] = cfg
     ctx.obj["config_path"] = config
@@ -47,10 +82,16 @@ def main(ctx, config):
 @click.pass_context
 def preprocess_gt(ctx, object_name, curvature, curvature_radius, curvature_tube, curvature_max_edge, visibility,
                   use_masks, clean_gt, force):
-    """Preprocess ground truth: clean mesh, sample point cloud and compute attributes."""
+    """Preprocess ground truth: clean mesh, sample point cloud and compute attributes.
+
+    With a custom view set (--views): only derives Groundtruth@<tag>, the base kit filtered by
+    visibility in these views (--force rebuilds it).
+    """
     from .pipeline.preprocess_gt import preprocess_gt as _preprocess_gt
 
     config = ctx.obj["config"]
+    if config.is_variant:
+        click.echo(f"Custom view set {config.variant}: deriving Groundtruth@{config.variant} from the base kit")
     if use_masks is not None:
         config.cleanup.use_masks = use_masks
     if curvature_radius is not None:
@@ -75,6 +116,7 @@ def proxy_curvature(ctx, object_name, force):
     from .pipeline.preprocess_gt import proxy_curvature as _proxy_curvature
 
     config = ctx.obj["config"]
+    _refuse_variant(config, "proxy-curvature")
     for obj in [object_name] if object_name else config.dataset.objects:
         _proxy_curvature(config, obj, force)
 
@@ -88,6 +130,7 @@ def preprocess_challenges(ctx, object_name, force):
     from .pipeline.preprocess_challenges import preprocess_challenges as _preprocess
 
     config = ctx.obj["config"]
+    _refuse_variant(config, "preprocess-challenges")
     objects = [object_name] if object_name else config.dataset.objects
 
     for obj in objects:
@@ -116,8 +159,7 @@ def cleanup(ctx, object_name, method_name, use_masks, force):
 
     for obj in objects:
         for method in methods:
-            method_dir = config.get_method_dir(obj, method)
-            lock_path = method_dir / ".cleanup_failed"
+            lock_path = config.get_lock_path(obj, method, "cleanup")
             if force and lock_path.exists():
                 lock_path.unlink()
             try:
@@ -146,8 +188,7 @@ def evaluate(ctx, object_name, method_name, force):
 
     for obj in objects:
         for method in methods:
-            method_dir = config.get_method_dir(obj, method)
-            lock_path = method_dir / ".eval_failed"
+            lock_path = config.get_lock_path(obj, method, "eval")
             if force and lock_path.exists():
                 lock_path.unlink()
             try:
@@ -167,13 +208,26 @@ def evaluate(ctx, object_name, method_name, force):
 @click.option("--workers", "-w", type=int, help="Max parallel workers")
 @click.option("--slurm", is_flag=True, help="Use SLURM instead of local execution")
 @click.option("--stages", multiple=True, default=["cleanup", "evaluate"], help="Stages to run")
+@click.option("--views", "views", default=None, help=_VIEWS_HELP)
+@click.option("--variant", "variant", default=None, help=_VARIANT_HELP)
 @click.pass_context
-def run(ctx, object_name, method_name, workers, slurm, stages):
-    """Run the full pipeline (cleanup + evaluate) for all objects/methods, or the ones given."""
+def run(ctx, object_name, method_name, workers, slurm, stages, views, variant):
+    """Run the full pipeline (cleanup + evaluate) for all objects/methods, or the ones given.
+
+    With --views: the usual cleanup (reused when it exists), a second cleaning step of the
+    reconstruction and of the GT point cloud on the custom views, then the evaluation of the two.
+    """
     config = ctx.obj["config"]
     config_path = ctx.obj["config_path"]
+    _apply_views(config, views, variant)
 
     stages = list(stages)
+
+    if config.is_variant and "evaluate" in stages and not slurm:
+        # The GT of the custom views, once per object, before the per-method jobs (with --slurm: a job per object).
+        from .pipeline.variant_gt import derive_variant_gt
+        for obj in [object_name] if object_name else config.dataset.objects:
+            derive_variant_gt(config, obj)
 
     if slurm:
         from .runner.slurm import SlurmRunner
@@ -244,11 +298,13 @@ def watch(ctx, dry_run, scan_mode, state_file):
     config_path = Path(ctx.obj["config_path"])
     state_path = Path(state_file) if state_file else None
 
+    config = ctx.obj["config"]
     n_submitted = run_watcher(
         config_path=config_path,
         state_path=state_path,
         dry_run=dry_run,
-        scan_mode=scan_mode
+        scan_mode=scan_mode,
+        variant=(config.variant, config.paths.views) if config.is_variant else None,
     )
 
     if dry_run:
@@ -264,10 +320,10 @@ def watch_status(ctx, state_file):
     """Show status of watched evaluation jobs."""
     from pathlib import Path
 
-    from .watcher.scanner import WatcherState
+    from .watcher.scanner import WatcherState, default_state_path
 
     config_path = Path(ctx.obj["config_path"])
-    state_path = Path(state_file) if state_file else config_path.parent / f".{config_path.stem}_state.json"
+    state_path = Path(state_file) if state_file else default_state_path(config_path, ctx.obj["config"])
 
     if not state_path.exists():
         click.echo("No state file found. Run 'watch' first.")
@@ -312,6 +368,7 @@ def aggregate(ctx, visibility_groups, curvature_thresholds):
     )
 
     config = ctx.obj["config"]
+    _refuse_variant(config, "aggregate")
 
     vis_groups = json.loads(visibility_groups) if visibility_groups else None
     curv_thresh = json.loads(curvature_thresholds) if curvature_thresholds else None
@@ -410,8 +467,7 @@ def visualize(ctx, object_name, method_name, metrics, views, scale, cmap, max_di
 
     for obj in objects:
         for method in methods:
-            method_dir = config.get_method_dir(obj, method)
-            lock_path = method_dir / ".viz_failed"
+            lock_path = config.get_lock_path(obj, method, "viz")
             if force and lock_path.exists():
                 lock_path.unlink()
             try:
@@ -550,6 +606,7 @@ def latex(ctx, output, decimals, no_mean):
     from .pipeline.latex_tables import generate_chamfer_table
 
     config = ctx.obj["config"]
+    _refuse_variant(config, "latex")
 
     tex = generate_chamfer_table(config, decimals=decimals, include_mean=not no_mean)
 
@@ -575,6 +632,7 @@ def figures(ctx, spec_path, out_dir, only):
     from .figures.run import run_figures
     from .figures.spec import load_spec
 
+    _refuse_variant(ctx.obj["config"], "figures")
     run_figures(ctx.obj["config"], load_spec(spec_path), out_dir, list(only) or None)
     click.echo(f"Written to {out_dir}")
 

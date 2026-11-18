@@ -1,5 +1,7 @@
 """Configuration system using Pydantic for validation."""
 
+import re
+import shlex
 from pathlib import Path
 from typing import Optional
 
@@ -58,6 +60,12 @@ class PathsConfig(BaseModel):
         default=None,
         description="Optional watertight-issue mask directory; culling is enabled automatically when PNG masks exist.",
     )
+    views: Optional[str] = Field(
+        default=None,
+        description="Sparse-view evaluation: SfMData file template of a custom view set (CLI --views). After the "
+        "usual cleanup, the reconstruction and the GT point cloud are filtered a second time by visibility in these "
+        "views. Their silhouettes are read from <dir of the file>/masks/ by view name.",
+    )
     output_root: Optional[Path] = Field(default=None, description="Output directory for generated scripts and aggregated results")
 
     @model_validator(mode="after")
@@ -79,6 +87,13 @@ class CleanupConfig(BaseModel):
     dilation_ref_n_pixels: int = Field(default=9568 * 6376, gt=0, description="Auto-dilation reference resolution in total pixels (H*W). Default = 9568x6376 (Martine full res). Auto radius = round(dilation_ref_px * sqrt(mask_n_pixels / dilation_ref_n_pixels))")
     z_threshold: Optional[float] = Field(default=None, description="Remove points below this z")
     use_masks: bool = Field(default=True, description="Use 2D masks for visibility filtering")
+    views_max_normal_angle: float = Field(
+        default=90.0, gt=0, le=180,
+        description="Sparse-view evaluation (--views) only: in the second cleaning step of the reconstruction and "
+        "of the GT point cloud, a custom view counts for a point only if it sees it from its front, i.e. the angle "
+        "(degrees) between the point's normal and the direction from the point to the camera is strictly below "
+        "this value. 90 = front side (normal . (camera - point) > 0).",
+    )
     watertight_orientation_ratio: float = Field(default=0.7, description="If < this fraction of sampled visible points face camera 0, flip normals before watertight_culling")
 
     @field_validator("dilation_radius")
@@ -226,6 +241,48 @@ class Config(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     aggregation: AggregationConfig = Field(default_factory=AggregationConfig)
     visualization: VisualizationConfig = Field(default_factory=VisualizationConfig)
+    variant: Optional[str] = Field(
+        default=None,
+        description="Tag of a sparse-view evaluation (with paths.views; default: the file name of paths.views "
+        "without its extension). Outputs go to results_cleaned@<tag>/, eval_results@<tag>/ and Groundtruth@<tag>/.",
+    )
+
+    @model_validator(mode="after")
+    def validate_variant(self) -> "Config":
+        self.variant = _variant_tag(self.variant, self.paths.views)
+        return self
+
+    def apply_views(self, views: str, tag: Optional[str] = None) -> "Config":
+        """Switch this config to a sparse-view evaluation (CLI --views, --variant)."""
+        tag = _variant_tag(tag, views)
+        self.variant = tag
+        self.paths.views = str(views)
+        return self
+
+    def default_view(self) -> "Config":
+        """This config without the custom view set: the usual evaluation (first cleaning step)."""
+        if not self.is_variant:
+            return self
+        base = self.model_copy(deep=True)
+        base.variant = None
+        base.paths.views = None
+        if hasattr(self, "_config_path"):
+            base._config_path = self._config_path
+        return base
+
+    @property
+    def is_variant(self) -> bool:
+        return self.variant is not None
+
+    def tagged(self, name: str) -> str:
+        """`name` in the default mode, `name@<tag>` in variant mode."""
+        return f"{name}@{self.variant}" if self.is_variant else name
+
+    def variant_cli_args(self) -> str:
+        """Global CLI options reproducing the custom view set in a sub-job ('' in the default mode)."""
+        if not self.is_variant:
+            return ""
+        return f"--views {shlex.quote(self.paths.views)} --variant {self.variant}"
 
     def _resolve_template(self, template: str, object_name: str, method_name: str = None) -> Path:
         """Resolve path template with placeholders.
@@ -309,11 +366,27 @@ class Config(BaseModel):
 
         Published datasets can ship an exact sampled GT and its point-aligned
         attributes. Legacy configurations continue to read the writable
-        ``Groundtruth`` workspace.
+        ``Groundtruth`` workspace. In variant mode: the derived kit ``Groundtruth@<tag>``.
         """
+        if self.is_variant:
+            return self.get_variant_gt_dir(object_name)
+        return self.get_base_gt_artifacts_dir(object_name)
+
+    def get_base_gt_artifacts_dir(self, object_name: str) -> Path:
+        """GT artefacts of the default evaluation (the source of a custom view set's derived kit)."""
         if self.paths.gt_artifacts_root:
             return self._resolve_template(self.paths.gt_artifacts_root, object_name)
         return self.get_gt_dir(object_name)
+
+    def get_variant_gt_dir(self, object_name: str) -> Path:
+        """Derived GT kit of the custom view set: the base kit filtered by visibility in its views."""
+        if not self.is_variant:
+            raise ValueError("get_variant_gt_dir needs a custom view set (--views)")
+        return self.get_eval_root(object_name) / f"Groundtruth@{self.variant}"
+
+    def get_gt_derived_dir(self, object_name: str) -> Path:
+        """Writable directory for GT-side outputs of the evaluation (e.g. GT renders)."""
+        return self.get_variant_gt_dir(object_name) if self.is_variant else self.get_gt_dir(object_name)
 
     def get_challenges_raw_dir(self, object_name: str) -> Path:
         """Get the raw challenge-source directory (read-only, under gt_source)."""
@@ -414,9 +487,26 @@ class Config(BaseModel):
             return masks_dir
         return self.get_data_root(object_name, method_name) / "mask"
 
+    def get_views_path(self, object_name: str, method_name: str = None) -> Path:
+        """SfMData file of the custom view set (second cleaning step of the reconstruction and of the GT).
+
+        visibility_count, challenges and visualize keep get_cameras_path.
+        """
+        if not self.is_variant:
+            raise ValueError("get_views_path needs a custom view set (--views)")
+        return self._resolve_template(self.paths.views, object_name, method_name)
+
+    def get_views_masks_dir(self, object_name: str, method_name: str = None) -> Path:
+        """Silhouettes of the custom view set: <dir of the file>/masks/."""
+        return self.get_views_path(object_name, method_name).parent / "masks"
+
+    def get_lock_path(self, object_name: str, method_name: str, stage: str) -> Path:
+        """Failure lock of a stage (cleanup, eval, viz) for a method."""
+        return self.get_method_dir(object_name, method_name) / self.tagged(f".{stage}_failed")
+
     def get_eval_dir(self, object_name: str, method_name: str) -> Path:
         """Get the evaluation output directory."""
-        return self.get_method_dir(object_name, method_name) / "eval_results"
+        return self.get_method_dir(object_name, method_name) / self.tagged("eval_results")
 
     def get_raw_mesh_path(self, object_name: str, method_name: str) -> Path:
         """Get the raw mesh path by searching for .ply or .obj files in results_raw."""
@@ -441,13 +531,30 @@ class Config(BaseModel):
 
     def get_cleaned_mesh_path(self, object_name: str, method_name: str) -> Path:
         """Get the cleaned mesh path."""
-        return self.get_method_dir(object_name, method_name) / "results_cleaned" / "mesh.ply"
+        return self.get_method_dir(object_name, method_name) / self.tagged("results_cleaned") / "mesh.ply"
 
     def _resolve_downscale_suffix(self, downscale: str) -> str:
         """Convert downscale name to path suffix: d1->'', d2->'_d2', etc."""
         if downscale == "d1":
             return ""
         return f"_{downscale}"
+
+
+_VARIANT_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _variant_tag(tag: Optional[str], views: Optional[str]) -> Optional[str]:
+    """Tag of a custom view set: `tag` if given, else the file name of `views` without its extension."""
+    if views is None:
+        if tag is not None:
+            raise ValueError("a variant tag (variant / --variant) needs a custom view set (paths.views / --views)")
+        return None
+    if tag is None:
+        tag = Path(str(views)).stem
+    if not _VARIANT_TAG.fullmatch(tag):
+        raise ValueError(f"variant tag {tag!r}: letters, digits, '.', '_' and '-' only (it names directories); "
+                         "give one with variant / --variant")
+    return tag
 
 
 def load_config(config_path: str | Path) -> Config:

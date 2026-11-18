@@ -14,11 +14,14 @@ from ..config import Config, load_config
 logger = logging.getLogger(__name__)
 
 
-def wrap_command(cmd: str, venv_path: Path, setup_script: Optional[str] = None) -> str:
+def wrap_command(cmd: str, venv_path: Optional[Path], setup_script: Optional[str] = None) -> str:
     """Shell line for a SLURM job: source the machine setup script (if any), select the headless
-    OSMesa backend, activate the virtualenv, then run *cmd*."""
+    OSMesa backend, activate the virtualenv (if any), then run *cmd*."""
     parts = [f"source {shlex.quote(str(setup_script))}"] if setup_script else []
-    parts += ["export PYOPENGL_PLATFORM=osmesa", f"source {venv_path / 'bin' / 'activate'}", cmd]
+    parts.append("export PYOPENGL_PLATFORM=osmesa")
+    if venv_path is not None:
+        parts.append(f"source {venv_path / 'bin' / 'activate'}")
+    parts.append(cmd)
     return " && ".join(parts)
 
 
@@ -87,13 +90,20 @@ class WatcherState:
 LOCK_FILES = (".cleanup_failed", ".eval_failed", ".viz_failed")
 
 
-def _has_lock(method_dir: Path) -> Optional[str]:
-    """Return the first lock file found in method_dir, or None."""
+def _has_lock(method_dir: Path, tag: Optional[str] = None) -> Optional[str]:
+    """Return the first lock file found in method_dir (those of variant `tag` if given), or None."""
     for lock in LOCK_FILES:
-        p = method_dir / lock
+        name = f"{lock}@{tag}" if tag else lock
+        p = method_dir / name
         if p.exists():
-            return lock
+            return name
     return None
+
+
+def default_state_path(config_path: Path, config: Config) -> Path:
+    """Watcher state beside the config; one per variant."""
+    suffix = f"@{config.variant}" if config.is_variant else ""
+    return Path(config_path).parent / f".{Path(config_path).stem}{suffix}_state.json"
 
 
 def _viz_complete(viz_dir: Path) -> bool:
@@ -166,7 +176,7 @@ class MeshScanner:
                     continue
 
                 # --- Gate 1: lock files → skip permanently until --force ---
-                lock = _has_lock(method_dir)
+                lock = _has_lock(method_dir, self.config.variant)
                 if lock:
                     logger.debug(f"Skipping locked {object_name}/{method_name}: {lock}")
                     continue
@@ -175,7 +185,7 @@ class MeshScanner:
                 cleaned_exists = self.config.get_cleaned_mesh_path(object_name, method_name).exists()
                 metrics_exists = (self.config.get_eval_dir(object_name, method_name) / "metrics.json").exists()
                 viz_ok = (not self.config.visualization.auto_generate
-                          or _viz_complete(method_dir / "visualizations"))
+                          or _viz_complete(method_dir / self.config.tagged("visualizations")))
 
                 if cleaned_exists and metrics_exists and viz_ok:
                     logger.debug(f"All stages done on disk: {object_name}/{method_name}")
@@ -280,9 +290,14 @@ class SlurmSubmitter:
         """Get the log directory for a job's SLURM output."""
         # Put logs in the method's eval directory
         method_dir = self.config.get_method_dir(job.object_name, job.method_name)
-        log_dir = method_dir / "slurm_logs"
+        log_dir = method_dir / self.config.tagged("slurm_logs")
         log_dir.mkdir(parents=True, exist_ok=True)
         return log_dir
+
+    @property
+    def _variant_opts(self) -> str:
+        """Global CLI options of the variant, with a leading space (empty in the default mode)."""
+        return f" {self.config.variant_cli_args()}" if self.config.is_variant else ""
 
     def _wrap_command(self, cmd: str) -> str:
         """Wrap a command with the optional setup script, headless rendering (osmesa) and the virtualenv."""
@@ -307,7 +322,7 @@ class SlurmSubmitter:
         # Sanitize names for SLURM
         safe_obj = job.object_name.replace("/", "_")
         safe_method = job.method_name.replace("/", "_")
-        job_name = f"cleanup_{safe_obj}_{safe_method}"[:64]
+        job_name = f"{self.config.tagged('cleanup')}_{safe_obj}_{safe_method}"[:64]
 
         if job_name in self._active_jobs:
             logger.info(f"Cleanup job {job_name} already in queue, skipping submission")
@@ -338,7 +353,7 @@ class SlurmSubmitter:
 
         cmd.extend([
             "--wrap",
-            self._wrap_command(f"eval-pipeline -c {self.config_path} cleanup --object {job.object_name} --method {job.method_name}")
+            self._wrap_command(f"eval-pipeline -c {self.config_path}{self._variant_opts} cleanup --object {job.object_name} --method {job.method_name}")
         ])
 
         try:
@@ -367,7 +382,7 @@ class SlurmSubmitter:
 
         safe_obj = job.object_name.replace("/", "_")
         safe_method = job.method_name.replace("/", "_")
-        job_name = f"eval_{safe_obj}_{safe_method}"[:64]
+        job_name = f"{self.config.tagged('eval')}_{safe_obj}_{safe_method}"[:64]
 
         if job_name in self._active_jobs:
             logger.info(f"Eval job {job_name} already in queue, skipping submission")
@@ -398,7 +413,7 @@ class SlurmSubmitter:
 
         cmd.extend([
             "--wrap",
-            self._wrap_command(f"eval-pipeline -c {self.config_path} evaluate --object {job.object_name} --method {job.method_name}")
+            self._wrap_command(f"eval-pipeline -c {self.config_path}{self._variant_opts} evaluate --object {job.object_name} --method {job.method_name}")
         ])
 
         try:
@@ -427,7 +442,7 @@ class SlurmSubmitter:
 
         safe_obj = job.object_name.replace("/", "_")
         safe_method = job.method_name.replace("/", "_")
-        job_name = f"viz_{safe_obj}_{safe_method}"[:64]
+        job_name = f"{self.config.tagged('viz')}_{safe_obj}_{safe_method}"[:64]
 
         if job_name in self._active_jobs:
             logger.info(f"Visualize job {job_name} already in queue, skipping submission")
@@ -457,7 +472,7 @@ class SlurmSubmitter:
 
         cmd.extend([
             "--wrap",
-            self._wrap_command(f"eval-pipeline -c {self.config_path} visualize --object {job.object_name} --method {job.method_name}")
+            self._wrap_command(f"eval-pipeline -c {self.config_path}{self._variant_opts} visualize --object {job.object_name} --method {job.method_name}")
         ])
 
         try:
@@ -498,10 +513,13 @@ class SlurmSubmitter:
             return None
 
         safe_obj = object_name.replace("/", "_")
-        job_name = f"preprocess_gt_{safe_obj}"[:64]
+        job_name = f"{self.config.tagged('preprocess_gt')}_{safe_obj}"[:64]
 
-        gt_dir = self.config.get_gt_dir(object_name)
-        log_dir = gt_dir / "slurm_logs"
+        if self.config.is_variant:
+            # beside Groundtruth@<tag>, which `preprocess-gt -f` rebuilds
+            log_dir = self.config.get_eval_root(object_name) / self.config.tagged("slurm_logs")
+        else:
+            log_dir = self.config.get_gt_dir(object_name) / "slurm_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         output_file = log_dir / "preprocess_gt_%j.out"
         error_file = log_dir / "preprocess_gt_%j.err"
@@ -519,7 +537,7 @@ class SlurmSubmitter:
             f"--output={output_file}",
             f"--error={error_file}",
             "--wrap",
-            self._wrap_command(f"eval-pipeline -c {self.config_path} preprocess-gt --object {object_name} -f")
+            self._wrap_command(f"eval-pipeline -c {self.config_path}{self._variant_opts} preprocess-gt --object {object_name} -f")
         ]
 
         try:
@@ -548,7 +566,7 @@ class SlurmSubmitter:
         method_dir = self.config.get_method_dir(job.object_name, job.method_name)
 
         # Lock files → refuse to submit
-        lock = _has_lock(method_dir)
+        lock = _has_lock(method_dir, self.config.variant)
         if lock:
             logger.warning(f"Skipping {job.object_name}/{job.method_name}: {lock}")
             job.status = "failed"
@@ -565,7 +583,7 @@ class SlurmSubmitter:
         need_cleanup = not self.config.get_cleaned_mesh_path(job.object_name, job.method_name).exists()
         need_eval = not (self.config.get_eval_dir(job.object_name, job.method_name) / "metrics.json").exists()
         need_viz = (self.config.visualization.auto_generate
-                    and not _viz_complete(method_dir / "visualizations"))
+                    and not _viz_complete(method_dir / self.config.tagged("visualizations")))
 
         if not need_cleanup and not need_eval and not need_viz:
             logger.info(f"All stages already done: {job.object_name}/{job.method_name}")
@@ -619,7 +637,8 @@ def run_watcher(
     config_path: Path,
     state_path: Optional[Path] = None,
     dry_run: bool = False,
-    scan_mode: str = "auto"  # "auto" or "config"
+    scan_mode: str = "auto",  # "auto" or "config"
+    variant: Optional[tuple[str, str]] = None,
 ) -> int:
     """Run the watcher: scan for new meshes and submit jobs.
 
@@ -628,14 +647,17 @@ def run_watcher(
         state_path: Path to state JSON file (default: beside config).
         dry_run: If True, don't actually submit jobs.
         scan_mode: "auto" scans all directories, "config" uses methods from config.
+        variant: (tag, view file template) of a custom view set given on the command line (--views).
 
     Returns:
         Number of jobs submitted.
     """
     config = load_config(config_path)
+    if variant is not None:
+        config.apply_views(variant[1], variant[0])
 
     if state_path is None:
-        state_path = config_path.parent / f".{config_path.stem}_state.json"
+        state_path = default_state_path(config_path, config)
 
     scanner = MeshScanner(config, state_path)
     submitter = SlurmSubmitter(config, config_path)

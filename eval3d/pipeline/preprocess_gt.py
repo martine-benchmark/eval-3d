@@ -64,6 +64,8 @@ def proxy_curvature(config: Config, object_name: str, force: bool = False):
     import trimesh
 
     from ..core.proxy import tiled_curvature
+    if config.is_variant:
+        raise ValueError("proxy-curvature belongs to the default kit; a variant subsets its curvature")
     ev = config.evaluation
     radius = 1.0 if ev.curvature_radius is None else ev.curvature_radius
     tag = f"e{ev.curvature_max_edge:g}" if ev.curvature_max_edge is not None else "gt"
@@ -105,7 +107,15 @@ def preprocess_gt(
         compute_visibility: Whether to compute visibility counts.
         clean_gt: Whether to clean the GT mesh by visibility.
         force: Overwrite existing files.
+
+    In variant mode, only derives Groundtruth@<tag> from the base kit (pipeline/variant_gt.py): the
+    other options do not apply, nothing is resampled.
     """
+    if config.is_variant:
+        from .variant_gt import derive_variant_gt
+        derive_variant_gt(config, object_name, force=force)
+        return
+
     gt_dir = config.get_gt_dir(object_name)
     parts = _raw_gt_parts(config, object_name)
 

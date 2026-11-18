@@ -1,7 +1,9 @@
 """SLURM job runner for HPC cluster execution."""
 
 import re
+import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -12,6 +14,11 @@ from .base import Job, JobRunner
 
 # Pattern for valid job names (alphanumeric, underscore, hyphen)
 SAFE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+# Job template of each stage, in slurm/templates/
+TEMPLATES = {"cleanup": "cleanup.sh.j2", "evaluate": "eval.sh.j2", "variant_gt": "gt.sh.j2"}
+# CLI subcommand of each stage
+SUBCOMMANDS = {"cleanup": "cleanup", "evaluate": "evaluate", "variant_gt": "preprocess-gt"}
 
 
 def sanitize_name(name: str) -> str:
@@ -60,8 +67,12 @@ class SlurmRunner(JobRunner):
             templates_dir = pkg_dir / "slurm" / "templates"
 
         self.templates_dir = Path(templates_dir)
-        self.scripts_dir = Path(scripts_dir) if scripts_dir else config.paths.output_root / "slurm_scripts"
+        self.scripts_dir = Path(scripts_dir) if scripts_dir else config.paths.output_root / config.tagged("slurm_scripts")
         self.scripts_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir = (config.paths.output_root / config.tagged("slurm_logs")).resolve()
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        # The jobs run in the environment that submits them.
+        self.venv_path = Path(sys.prefix) if (Path(sys.prefix) / "bin" / "activate").exists() else None
 
         self.env = Environment(loader=FileSystemLoader(str(self.templates_dir)))
 
@@ -81,10 +92,10 @@ class SlurmRunner(JobRunner):
         """
         # Sanitize inputs to prevent shell injection
         safe_object = sanitize_name(job.object_name)
-        safe_method = sanitize_name(job.method_name)
+        safe_method = sanitize_name(job.method_name) if job.method_name else ""  # none for the GT of a view set
+        suffix = f"{safe_object}_{safe_method}" if safe_method else safe_object
 
-        template_name = f"{job.stage}.sh.j2"
-        template = self.env.get_template(template_name)
+        template = self.env.get_template(TEMPLATES[job.stage])
 
         if job.stage == "cleanup":
             resources = self.slurm_config.cleanup
@@ -100,14 +111,40 @@ class SlurmRunner(JobRunner):
             object=safe_object,
             method=safe_method,
             config_path=job.config_path,
-            job_name=f"{job.stage}_{safe_object}_{safe_method}",
+            job_name=f"{self.config.tagged(job.stage)}_{suffix}",
+            log_dir=self.logs_dir,
+            command=self._command(job, safe_object, safe_method),
         )
 
-        script_path = self.scripts_dir / f"{job.stage}_{safe_object}_{safe_method}.sh"
+        script_path = self.scripts_dir / f"{job.stage}_{suffix}.sh"
         script_path.write_text(script_content)
         script_path.chmod(0o755)
 
         return script_path
+
+    def _command(self, job: Job, safe_object: str, safe_method: str) -> str:
+        """Shell line of the job: setup script, virtualenv, then the stage on one object/method.
+
+        The global options (config, custom view set) come before the subcommand.
+        """
+        from ..watcher.scanner import wrap_command
+
+        if not job.config_path:
+            raise ValueError("the SLURM runner needs the path of the config file")
+        config_path = shlex.quote(str(Path(job.config_path).resolve()))
+        variant_opts = f" {self.config.variant_cli_args()}" if self.config.is_variant else ""
+        cmd = f"eval-pipeline -c {config_path}{variant_opts} {SUBCOMMANDS[job.stage]} --object {safe_object}"
+        if safe_method:
+            cmd += f" --method {safe_method}"
+        return wrap_command(cmd, self.venv_path, self.slurm_config.setup_script)
+
+    def submit_variant_gt(self, config, objects: list[str]) -> dict[str, str]:
+        """With a custom view set: one job per object deriving Groundtruth@<tag> (kept when up to date)."""
+        if not config.is_variant:
+            return {}
+        config_path = str(config._config_path) if hasattr(config, "_config_path") else ""
+        return {obj: self.submit(Job(object_name=obj, method_name="", stage="variant_gt", config_path=config_path))
+                for obj in objects}
 
     def submit(self, job: Job) -> str:
         """Submit a job to SLURM.

@@ -1,0 +1,24 @@
+#!/bin/bash
+#SBATCH --job-name={{ job_name }}
+#SBATCH --account={{ account }}
+#SBATCH --partition={{ partition }}
+#SBATCH --cpus-per-task={{ cpus }}
+#SBATCH --mem={{ mem_gb }}G
+#SBATCH --time={{ time }}
+#SBATCH --output={{ log_dir }}/%x_%j.out
+#SBATCH --error={{ log_dir }}/%x_%j.err
+
+# GT of the custom view set for {{ object }}
+
+set -eo pipefail
+
+echo "Starting GT job of the custom view set: {{ object }}"
+echo "Node: $(hostname)"
+echo "Date: $(date)"
+echo "Config: {{ config_path }}"
+
+# Machine setup script (execution.slurm.setup_script), virtualenv, then the stage
+{{ command }}
+
+echo "GT of the custom view set completed: {{ object }}"
+echo "End date: $(date)"

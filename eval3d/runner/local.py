@@ -23,6 +23,8 @@ def _run_job(job_dict: dict) -> tuple[str, bool]:
     """
     try:
         config = load_config(job_dict["config_path"])
+        if job_dict.get("variant") is not None:
+            config.apply_views(job_dict["views"], job_dict["variant"])
         obj = job_dict["object_name"]
         method = job_dict["method_name"]
         stage = job_dict["stage"]
@@ -87,6 +89,10 @@ class LocalRunner(JobRunner):
             "stage": job.stage,
             "config_path": job.config_path or str(self.config_path),
         }
+        if self.config.is_variant:
+            # The job reloads the config file: carry a custom view set given on the command line.
+            self._pending_jobs[job_id]["variant"] = self.config.variant
+            self._pending_jobs[job_id]["views"] = self.config.paths.views
         self._dependencies[job_id] = []
         return job_id
 

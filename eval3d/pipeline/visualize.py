@@ -114,10 +114,11 @@ def visualize_method(
         integrated_colorbar = config.visualization.integrated_colorbar
 
     vis_suffix = "visualizations_remove" if exclude_mode == "remove" else "visualizations"
-    vis_dir = method_dir / vis_suffix
-    # GT renders/bbox.json are DERIVED: write them to the workspace Groundtruth dir,
-    # never into gt_dir, which may be the (read-only by contract) published GT kit.
-    gt_vis_dir = config.get_gt_dir(object_name) / vis_suffix
+    vis_dir = method_dir / config.tagged(vis_suffix)
+    # GT renders/bbox.json are DERIVED: write them to the workspace Groundtruth dir
+    # (Groundtruth@<tag> for a variant), never into gt_dir, which may be the (read-only
+    # by contract) published GT kit.
+    gt_vis_dir = config.get_gt_derived_dir(object_name) / vis_suffix
 
     # Use config defaults if not specified
     if view_indices is None:

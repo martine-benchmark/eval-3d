@@ -6,6 +6,7 @@ Every `eval-pipeline` subcommand in one table; the stage-by-stage flow is in [pi
 
 Every command takes `-c/--config` (required) and most take `-o/--object`, `-m/--method` and `-f/--force`.
 `uv run eval-pipeline -c <config> <command> --help` lists the options of one command.
+`--views <file.sfm>` (on `run`, or as a global option) evaluates a sparse-view reconstruction on the surface its views see, with outputs in `@<tag>` directories: see [pipeline.md](pipeline.md#sparse-view-evaluation).
 
 | Command | What it does |
 | :-- | :-- |
