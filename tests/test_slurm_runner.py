@@ -22,7 +22,7 @@ def _runner(tmp_path, setup_script=None):
 
 
 def _command_line(script: Path) -> str:
-    (line,) = [l for l in script.read_text().splitlines() if "eval-pipeline" in l]
+    (line,) = [text for text in script.read_text().splitlines() if "eval-pipeline" in text]
     return line
 
 
