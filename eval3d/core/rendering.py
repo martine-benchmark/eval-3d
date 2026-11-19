@@ -90,7 +90,8 @@ class OffscreenRenderer:
         Args:
             mesh: Trimesh with vertex_colors set
             Rt: Extrinsic matrix [R|t] (4x4), world-to-camera
-            lighting_mode: "uniform" for surface detail (directional), "colored" for vivid colors (ambient)
+            lighting_mode: "uniform" for surface detail (shaded, directional light), "colored" for the exact
+                vertex colors (flat, no shading: heatmaps)
 
         Returns:
             RGB image as numpy array (H, W, 3), dtype uint8
@@ -106,7 +107,7 @@ class OffscreenRenderer:
                 ambient_light=[0.3, 0.3, 0.3],
             )
         else:
-            # High ambient for vivid vertex colors
+            # Colored renders are flat (see the render flags below): the lights have no effect on them
             scene = pyrender.Scene(
                 bg_color=_BG,
                 ambient_light=[0.6, 0.6, 0.6],
@@ -139,8 +140,10 @@ class OffscreenRenderer:
             light = pyrender.DirectionalLight(color=[1.0, 1.0, 1.0], intensity=1.5)
         scene.add(light, pose=camera_pose)
 
-        # Render
-        color, _ = self.renderer.render(scene)
+        # Render. A colored mesh carries a colormap read against its colorbar: it is drawn flat (vertex colors as
+        # they are, no shading), otherwise the lighting changes every color with the surface orientation.
+        flags = pyrender.RenderFlags.NONE if lighting_mode == "uniform" else pyrender.RenderFlags.FLAT
+        color, _ = self.renderer.render(scene, flags=flags)
 
         return color
 
