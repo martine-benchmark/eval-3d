@@ -105,3 +105,40 @@ def test_render_views(tmp_path):
     assert len(paths) == 1
     assert paths[0].exists()
     assert paths[0].suffix == ".png"
+
+
+def _tilted_square(color):
+    """A square facing an OpenCV camera at the origin, tilted 60 degrees from the image plane, of one color."""
+    c, s = np.cos(np.radians(60)), np.sin(np.radians(60))
+    vertices = np.array([[-1, -1, 4 + s], [1, -1, 4 - s], [1, 1, 4 - s], [-1, 1, 4 + s]], dtype=np.float32)
+    vertices[:, 0] *= c
+    mesh = trimesh.Trimesh(vertices=vertices, faces=np.array([[0, 2, 1], [0, 3, 2]]), process=False)
+    mesh.visual.vertex_colors = np.tile(np.array([*color, 255], dtype=np.uint8), (4, 1))
+    return mesh
+
+
+_K = np.array([[500, 0, 320, 0], [0, 500, 240, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+
+
+@pytest.mark.gl
+def test_colored_render_keeps_the_exact_vertex_colors():
+    """A heatmap is read against its colorbar: a colored render must not be shaded by the lighting."""
+    from eval3d.core.rendering import OffscreenRenderer
+
+    color = (68, 1, 84)   # viridis at 0
+    with OffscreenRenderer(640, 480, _K) as renderer:
+        image = renderer.render_mesh(_tilted_square(color), np.eye(4, dtype=np.float32), lighting_mode="colored")
+    drawn = image[np.any(image != 255, axis=-1)]
+    assert len(drawn) > 1000
+    assert np.abs(drawn.astype(int) - color).max() <= 1
+
+
+@pytest.mark.gl
+def test_uniform_render_is_still_shaded():
+    """The grey mesh render shows the surface relief: its lighting stays."""
+    from eval3d.core.rendering import OffscreenRenderer
+
+    with OffscreenRenderer(640, 480, _K) as renderer:
+        image = renderer.render_mesh(_tilted_square((200, 200, 200)), np.eye(4, dtype=np.float32), lighting_mode="uniform")
+    drawn = image[np.any(image != 255, axis=-1)]
+    assert len(drawn) > 1000 and np.abs(drawn.astype(int) - 200).max() > 5
