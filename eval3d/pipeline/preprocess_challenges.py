@@ -34,17 +34,26 @@ def _transfer_mesh_mask_to_pcd(
     vertex_mask: np.ndarray,
     gt_pcd: np.ndarray,
     max_dist: float,
+    faces: np.ndarray | None = None,
+    chunk: int = 200_000,
 ) -> np.ndarray:
-    """Transfer a boolean mask from mesh vertices to GT point cloud via nearest neighbor.
+    """Transfer a boolean mask from mesh vertices to the GT point cloud.
 
-    Builds KDTree on ALL mesh vertices (not just marked ones) for efficiency,
-    then checks if the nearest vertex is marked.
+    A point takes the label of its nearest mesh vertex when that vertex is closer than
+    ``max_dist``. With ``faces``, the other points are tested against the mesh *surface*: a
+    point closer than ``max_dist`` to its closest triangle takes the label of the vertex of
+    that triangle nearest to the closest surface point. Without this second step a mesh
+    coarser than the point cloud loses every point lying in the middle of a triangle
+    (edges longer than ``2 * max_dist``). The threshold is kept in both steps: it stops a
+    point from taking the label of another sheet of a thin wall.
 
     Args:
         mesh_vertices: Mesh vertices (M, 3).
         vertex_mask: Boolean mask on mesh vertices (M,).
         gt_pcd: GT point cloud (N, 3).
         max_dist: Maximum distance for transfer.
+        faces: Mesh triangles (F, 3); None keeps the nearest-vertex test alone.
+        chunk: Number of points per closest-triangle query.
 
     Returns:
         Boolean mask on gt_pcd (N,).
@@ -54,7 +63,21 @@ def _transfer_mesh_mask_to_pcd(
 
     tree = cKDTree(mesh_vertices)
     dists, indices = tree.query(gt_pcd, k=1, workers=-1)
-    return (dists < max_dist) & vertex_mask[indices]
+    near = dists < max_dist
+    out = near & vertex_mask[indices]
+    if faces is None or len(faces) == 0 or near.all():
+        return out
+
+    mesh = trimesh.Trimesh(np.asarray(mesh_vertices), np.asarray(faces), process=False)
+    far = np.flatnonzero(~near)
+    for start in range(0, len(far), chunk):
+        sel = far[start:start + chunk]
+        closest, surface_dist, triangle = trimesh.proximity.closest_point(mesh, gt_pcd[sel])
+        corners = mesh.faces[triangle]
+        nearest = np.argmin(np.linalg.norm(mesh.vertices[corners] - closest[:, None, :], axis=2), axis=1)
+        label = vertex_mask[corners[np.arange(len(sel)), nearest]]
+        out[sel] = (surface_dist < max_dist) & label
+    return out
 
 
 def _process_ply(
@@ -74,7 +97,7 @@ def _process_ply(
         print("    WARNING: no red vertices found")
         return np.zeros(len(gt_pcd), dtype=bool)
 
-    return _transfer_mesh_mask_to_pcd(mesh.vertices, red_mask, gt_pcd, max_dist)
+    return _transfer_mesh_mask_to_pcd(mesh.vertices, red_mask, gt_pcd, max_dist, faces=mesh.faces)
 
 
 def _process_png(
@@ -122,7 +145,7 @@ def _process_png(
     n_marked = vertex_mask.sum()
     print(f"    Marked {n_marked:,} mesh vertices (in mask + visible)")
 
-    return _transfer_mesh_mask_to_pcd(gt_mesh.vertices, vertex_mask, gt_pcd, max_dist)
+    return _transfer_mesh_mask_to_pcd(gt_mesh.vertices, vertex_mask, gt_pcd, max_dist, faces=gt_mesh.faces)
 
 
 def preprocess_challenges(
