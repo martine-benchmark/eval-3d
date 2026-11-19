@@ -68,15 +68,30 @@ def _transfer_mesh_mask_to_pcd(
     if faces is None or len(faces) == 0 or near.all():
         return out
 
+    # Only the triangles whose bounding box comes within max_dist of the point can be closer
+    # than max_dist: the search stays local, whatever the distance of the point to the mesh.
     mesh = trimesh.Trimesh(np.asarray(mesh_vertices), np.asarray(faces), process=False)
+    rtree = mesh.triangles_tree
+    triangles = mesh.triangles
     far = np.flatnonzero(~near)
     for start in range(0, len(far), chunk):
         sel = far[start:start + chunk]
-        closest, surface_dist, triangle = trimesh.proximity.closest_point(mesh, gt_pcd[sel])
-        corners = mesh.faces[triangle]
-        nearest = np.argmin(np.linalg.norm(mesh.vertices[corners] - closest[:, None, :], axis=2), axis=1)
-        label = vertex_mask[corners[np.arange(len(sel)), nearest]]
-        out[sel] = (surface_dist < max_dist) & label
+        pts = np.asarray(gt_pcd[sel], dtype=np.float64)
+        boxes = np.hstack([pts - max_dist, pts + max_dist])
+        candidates = [list(rtree.intersection(box)) for box in boxes]
+        counts = np.fromiter((len(c) for c in candidates), dtype=np.int64, count=len(sel))
+        if not counts.any():
+            continue
+        point_id = np.repeat(np.arange(len(sel)), counts)
+        face_id = np.fromiter((f for c in candidates for f in c), dtype=np.int64, count=int(counts.sum()))
+        closest = trimesh.triangles.closest_point(triangles[face_id], pts[point_id])
+        surface_dist = np.linalg.norm(closest - pts[point_id], axis=1)
+        order = np.lexsort((surface_dist, point_id))
+        best = order[np.r_[True, point_id[order][1:] != point_id[order][:-1]]]
+        corners = mesh.faces[face_id[best]]
+        nearest = np.argmin(np.linalg.norm(mesh.vertices[corners] - closest[best][:, None, :], axis=2), axis=1)
+        label = vertex_mask[corners[np.arange(len(best)), nearest]]
+        out[sel[point_id[best]]] = (surface_dist[best] < max_dist) & label
     return out
 
 

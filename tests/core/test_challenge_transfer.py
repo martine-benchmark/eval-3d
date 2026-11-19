@@ -47,3 +47,9 @@ def test_points_next_to_a_vertex_keep_the_nearest_vertex_label():
     points = np.c_[rng.uniform(0, 0.25, (200, 2)), rng.uniform(-0.02, 0.02, 200)]
     old = _transfer_mesh_mask_to_pcd(vertices, mask, points, 0.1)
     assert (_transfer_mesh_mask_to_pcd(vertices, mask, points, 0.1, faces=faces) == old).all()
+
+
+def test_a_point_far_from_the_mesh_is_not_labelled():
+    points = np.array([[3.0, 3.0, 8.0], [50.0, 50.0, 0.0], [3.0, 3.0, 0.0]])
+    got = _transfer_mesh_mask_to_pcd(TRIANGLE, np.array([True, True, True]), points, 0.1, faces=FACE)
+    assert got.tolist() == [False, False, True]
