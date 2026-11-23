@@ -195,3 +195,30 @@ def compute_metrics(
         **chamfer,
         **{k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in curves.items()},
     }
+
+
+# Failure flags written next to the metrics. Recomputable from the distances and the current kit, so never carried
+# over from a previous metrics.json.
+FAILURE_KEYS = ("empty_reconstruction", "empty_reason")
+NO_DATA_KEPT = "no_data_point_outside_excluded"
+
+
+def mark_failure_if_no_data_kept(metrics: dict, n_data_kept: int) -> dict:
+    """Record a cell with no reconstructed point left after the GT exclusion as a failure of the method.
+
+    When every data point has its nearest GT point in an exclusion zone (`excluded.npy`), no data point is scored
+    and the metrics are NaN: like an empty mesh, the cell is flagged `empty_reconstruction` (the figures count it as
+    a failure), with `empty_reason` telling the two cases apart. A flag already set (empty mesh) is left as is.
+    Rule of 2026-11-23 (grid, v3 kit).
+
+    Args:
+        metrics: Metrics dict, updated in place.
+        n_data_kept: Number of data points left after the exclusion.
+
+    Returns:
+        The same dict.
+    """
+    if n_data_kept == 0 and not metrics.get("empty_reconstruction"):
+        metrics["empty_reconstruction"] = True
+        metrics["empty_reason"] = NO_DATA_KEPT
+    return metrics

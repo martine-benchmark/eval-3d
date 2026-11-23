@@ -18,7 +18,7 @@ import numpy as np
 
 from ..config import Config
 from ..core.masking import apply_exclude, load_gt_exclude
-from ..core.metrics import compute_fscore_curve, compute_metrics
+from ..core.metrics import FAILURE_KEYS, compute_fscore_curve, compute_metrics, mark_failure_if_no_data_kept
 
 
 def recompute_metrics(
@@ -96,6 +96,7 @@ def recompute_metrics(
         config.evaluation.fscore_thresholds,
         config.evaluation.max_dist,
     )
+    mark_failure_if_no_data_kept(metrics, len(dist_data2gt))
 
     gt_points_path = distances_dir / "gt_points.npy"
     data_points_path = distances_dir / "data_points.npy"
@@ -117,7 +118,7 @@ def recompute_metrics(
             with open(metrics_path) as f:
                 previous = json.load(f)
             for key, value in previous.items():
-                if key not in metrics:
+                if key not in metrics and key not in FAILURE_KEYS:
                     metrics[key] = value
         except (json.JSONDecodeError, OSError) as e:
             print(f"    Could not merge previous metrics.json ({e}), writing fresh")
