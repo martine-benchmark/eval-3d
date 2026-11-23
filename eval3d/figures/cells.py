@@ -1,8 +1,9 @@
 """Per-object results of the declared cells, read from each cell's metrics.json.
 
 Status rule: a declared cell whose metrics.json is absent for an object, or records an empty reconstruction (a mesh
-with no vertex: `empty_reconstruction`, written by evaluate), is a failure of the method on that object; an undeclared
-cell was never run and is reported as such, never as a failure.
+with no vertex, or no reconstructed point left outside the GT `excluded` zones: `empty_reconstruction`, written by
+evaluate and recompute), is a failure of the method on that object; an undeclared cell was never run and is reported
+as such, never as a failure.
 """
 
 import json

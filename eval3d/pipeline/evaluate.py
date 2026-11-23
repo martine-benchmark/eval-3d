@@ -8,7 +8,7 @@ import numpy as np
 from ..config import Config
 from ..core.masking import apply_exclude, load_gt_exclude
 from ..core.mesh import load_mesh
-from ..core.metrics import compute_distances, compute_metrics
+from ..core.metrics import compute_distances, compute_metrics, mark_failure_if_no_data_kept
 from ..core.sampling import downsample_pcd, remove_nan_points, upsample_mesh
 
 
@@ -130,6 +130,7 @@ def evaluate(
         config.evaluation.fscore_thresholds,
         config.evaluation.max_dist,
     )
+    mark_failure_if_no_data_kept(metrics, len(dist_data2gt_filtered))
     metrics["seed"] = seed
     metrics["n_gt_points"] = len(gt_pcd)
     metrics["n_data_points"] = len(data_down)
