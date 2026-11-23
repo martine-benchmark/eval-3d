@@ -11,7 +11,7 @@ import numpy as np
 
 from eval3d.config import Config
 from eval3d.core.metrics import mark_failure_if_no_data_kept
-from eval3d.pipeline.recompute import recompute_metrics
+from eval3d.pipeline.metrics import compute_cell_metrics as recompute_metrics
 
 N_GT, N_DATA = 40, 10
 

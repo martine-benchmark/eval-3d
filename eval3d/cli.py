@@ -179,7 +179,7 @@ def cleanup(ctx, object_name, method_name, use_masks, force):
 @click.option("--force", "-f", is_flag=True, help="Overwrite existing files")
 @click.pass_context
 def evaluate(ctx, object_name, method_name, force):
-    """Evaluate meshes: compute distances, Chamfer, F-score."""
+    """Evaluate meshes: the distances stage, then the metrics stage (Chamfer, F-score)."""
     from .pipeline.evaluate import evaluate as _evaluate
 
     config = ctx.obj["config"]
@@ -200,6 +200,30 @@ def evaluate(ctx, object_name, method_name, force):
                 lock_path.write_text(f"{datetime.now().isoformat()}: {e}\n")
                 click.echo(f"FAILED {obj}/{method}: {e} (lock: {lock_path})")
                 raise
+
+
+@main.command()
+@click.option("--object", "-o", "object_name", help="Object name (default: all)")
+@click.option("--method", "-m", "method_name", help="Method name (default: all)")
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing distances")
+@click.pass_context
+def distances(ctx, object_name, method_name, force):
+    """Distances stage alone: sample the cleaned mesh, write distances/*.npy (run `metrics` next)."""
+    from .pipeline.distances import distances_stage
+
+    config = ctx.obj["config"]
+    objects = [object_name] if object_name else config.dataset.objects
+    methods = [method_name] if method_name else config.dataset.methods
+
+    computed = 0
+    for obj in objects:
+        for method in methods:
+            try:
+                computed += distances_stage(config, obj, method, force)
+            except FileNotFoundError as e:
+                click.echo(f"Skipping {obj}/{method}: {e}")
+
+    click.echo(f"Computed distances for {computed} combos")
 
 
 @main.command()
@@ -563,9 +587,9 @@ def curves(ctx, object_name, method_name, n_thresholds, max_threshold, force, ex
     help="Also process __*_bak / __rerun* directories (off by default: they are archives)",
 )
 @click.pass_context
-def recompute(ctx, object_name, method_name, extra_exclude, allow_backup_dirs):
-    """Recompute metrics.json + curves from saved distances (no re-eval needed)."""
-    from .pipeline.recompute import recompute_metrics
+def metrics(ctx, object_name, method_name, extra_exclude, allow_backup_dirs):
+    """Metrics stage alone: metrics.json + curves from the saved distances (no nearest-neighbour search)."""
+    from .pipeline.metrics import compute_cell_metrics
 
     config = ctx.obj["config"]
     objects = [object_name] if object_name else config.dataset.objects
@@ -589,11 +613,11 @@ def recompute(ctx, object_name, method_name, extra_exclude, allow_backup_dirs):
             ]
 
         for method in method_list:
-            result = recompute_metrics(config, obj, method, extra_exclude=extra)
+            result = compute_cell_metrics(config, obj, method, extra_exclude=extra)
             if result is not None:
                 computed += 1
 
-    click.echo(f"Recomputed metrics for {computed} combos (max_dist={config.evaluation.max_dist})")
+    click.echo(f"Computed metrics for {computed} combos (max_dist={config.evaluation.max_dist})")
 
 
 @main.command()

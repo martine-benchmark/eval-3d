@@ -12,9 +12,10 @@ Every command takes `-c/--config` (required) and most take `-o/--object`, `-m/--
 | :-- | :-- |
 | `preprocess-gt` | Clean the GT mesh, sample its point cloud, compute per-point attributes (not needed for Martine: `gt/` ships them) |
 | `cleanup` | Carve reconstructed vertices that project outside every silhouette |
-| `evaluate` | Distances, Chamfer, F-score → `eval_results/metrics.json` |
+| `evaluate` | The two stages below, one after the other: `distances`, then `metrics` |
+| `distances` | Stage 1 alone: sample the cleaned mesh, nearest-neighbour distances → `eval_results/distances/` |
+| `metrics` | Stage 2 alone: Chamfer, F-score from the saved distances → `eval_results/metrics.json` and curves (new `max_dist`, new mask) |
 | `curves` | Dense precision / recall / F-score curves from the saved distances |
-| `recompute` | Rebuild `metrics.json` and curves from saved distances (new `max_dist`, new mask) |
 | `run` | `cleanup` + `evaluate` over the config's objects and methods (or `-o`, `-m`), locally or on SLURM (`--slurm`) |
 | `apply-masks` | Per-zone distances from the GT attribute and challenge masks |
 | `preprocess-challenges` | Build challenge masks from painted meshes or per-view 2D masks |

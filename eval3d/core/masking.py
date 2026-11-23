@@ -1,8 +1,8 @@
-"""GT-side exclusion masks, shared by evaluate / recompute / curves.
+"""GT-side exclusion masks, shared by the metrics stage (evaluate, metrics) and curves.
 
 Single source of truth for "which GT points count, and which reconstructed points
 inherit that decision". Before this module the mask logic lived inline in
-`evaluate.py` only — `recompute.py` and `curves.py` silently skipped it, which made
+`evaluate.py` only — the former `recompute.py` and `curves.py` silently skipped it, which made
 the curves on disk inconsistent with the `metrics.json` sitting next to them for
 every object carrying a `challenges/excluded.npy`.
 

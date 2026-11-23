@@ -4,8 +4,8 @@
 import numpy as np
 
 from ..config import Config
-from ..core.masking import apply_exclude, load_gt_exclude
 from ..core.metrics import compute_fscore_curve
+from .metrics import has_distances, mask_distances, read_distances
 
 
 def compute_curves(
@@ -19,7 +19,7 @@ def compute_curves(
 ) -> dict | None:
     """Compute dense P/R/F curves from pre-computed distances.
 
-    Requires evaluate to have run first (distances/*.npy must exist).
+    Requires the distances stage to have run first (distances/*.npy must exist).
 
     Args:
         config: Pipeline configuration.
@@ -28,21 +28,18 @@ def compute_curves(
         n_thresholds: Number of thresholds to sample.
         max_threshold: Maximum threshold value (mm).
         force: Overwrite existing curves.
+        extra_exclude: Additional GT exclusion masks (see `core.masking`).
 
     Returns:
         Dict with thresholds/precision/recall/fscore arrays, or None if skipped.
     """
     eval_dir = config.get_eval_dir(object_name, method_name)
-    distances_dir = eval_dir / "distances"
     cleaned_mesh = config.get_cleaned_mesh_path(object_name, method_name)
 
     if not cleaned_mesh.exists():
         return None
 
-    d2g_path = distances_dir / "data2gt_dist.npy"
-    g2d_path = distances_dir / "gt2data_dist.npy"
-
-    if not d2g_path.exists() or not g2d_path.exists():
+    if not has_distances(eval_dir):
         return None
 
     out_dir = eval_dir / "curves"
@@ -54,25 +51,11 @@ def compute_curves(
 
     print(f"  Computing dense curves: {object_name}/{method_name}")
 
-    dist_data2gt = np.load(d2g_path)
-    dist_gt2data = np.load(g2d_path)
-
-    # Apply the same GT exclusion mask as `evaluate`. Without this the curves written
-    # here contradicted the metrics.json written next to them for the 21 of 27 objects
-    # carrying an excluded.npy — and `curves` runs *after* `evaluate`, so it was the
-    # inconsistent version that survived on disk.
-    idx_path = distances_dir / "data2gt_idx.npy"
-    gt_dir = config.get_gt_artifacts_dir(object_name)
-    exclude, _applied = load_gt_exclude(
-        gt_dir, n_gt=len(dist_gt2data), extra_exclude=extra_exclude
-    )
-    if exclude is not None:
-        if not idx_path.exists():
-            print("    Cannot apply exclusion mask: data2gt_idx.npy missing — skipping")
-            return None
-        dist_data2gt, dist_gt2data = apply_exclude(
-            dist_data2gt, dist_gt2data, np.load(idx_path), exclude
-        )
+    # Same GT exclusion masks as the metrics stage, or the curves would contradict the metrics.json next to them.
+    masked = mask_distances(*read_distances(eval_dir), eval_dir, config.get_gt_artifacts_dir(object_name), extra_exclude)
+    if masked is None:
+        return None
+    dist_data2gt, dist_gt2data, _applied = masked
 
     thresholds = np.linspace(0, max_threshold, n_thresholds)
     result = compute_fscore_curve(dist_data2gt, dist_gt2data, thresholds)
