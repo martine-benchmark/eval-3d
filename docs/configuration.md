@@ -44,7 +44,7 @@ index.
 `excluded.npy` is applied automatically whenever the file exists. Whatever was applied is
 recorded in `metrics["exclude_masks"]`, so a result file states what was done rather than what
 was supposed to be done. Extra masks can be requested per run with `--extra-exclude <name>` on
-`curves` and `recompute`.
+`curves` and `metrics`.
 
 ## The units trap (skoltech3d)
 

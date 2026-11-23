@@ -833,7 +833,7 @@ def test_variant_chain_writes_only_tagged_outputs(tmp_path):
     before = _tree_hashes(tmp_path)
 
     v = (sfm, TAG)
-    for args in (["preprocess-gt"], ["cleanup"], ["evaluate"], ["apply-masks"], ["curves"], ["recompute"]):
+    for args in (["preprocess-gt"], ["cleanup"], ["evaluate"], ["apply-masks"], ["curves"], ["metrics"], ["distances", "-f"]):
         result = _cli(config_path, *args, variant=v)
         assert result.exit_code == 0, (args, result.output)
 

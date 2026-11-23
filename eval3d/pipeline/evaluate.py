@@ -1,15 +1,17 @@
-"""Global evaluation: compute distances, Chamfer, and F-score metrics."""
+"""Evaluation of a cell: the distances stage, then the metrics stage.
+
+    cleaned mesh + GT cloud --[pipeline/distances.py]--> distances/*.npy
+                            --[pipeline/metrics.py]----> metrics.json, curves/
+
+Each stage also runs alone (`eval-pipeline distances`, `eval-pipeline metrics`).
+"""
 
 import json
-from pathlib import Path
-
-import numpy as np
 
 from ..config import Config
 from ..core.masking import apply_exclude, load_gt_exclude
-from ..core.mesh import load_mesh
-from ..core.metrics import compute_distances, compute_metrics, mark_failure_if_no_data_kept
-from ..core.sampling import downsample_pcd, remove_nan_points, upsample_mesh
+from .distances import compute_cell_distances, save_cell_distances
+from .metrics import build_metrics, write_metrics
 
 
 def evaluate(
@@ -29,21 +31,22 @@ def evaluate(
         - curves/thresholds.npy, precision.npy, recall.npy, fscore.npy
         - metrics.json
 
+    An empty reconstruction is recorded as a failure: metrics.json (NaN, `empty_reconstruction`) and curves, no
+    distances.
+
     Args:
         config: Pipeline configuration.
         object_name: Object name.
         method_name: Method name.
         force: Overwrite existing output.
         seed: Random seed for reproducibility.
+        extra_exclude: Additional GT exclusion masks (see `core.masking`).
 
     Returns:
         Dictionary with computed metrics.
     """
     gt_dir = config.get_gt_artifacts_dir(object_name)
     eval_dir = config.get_eval_dir(object_name, method_name)
-    cleaned_mesh_path = config.get_cleaned_mesh_path(object_name, method_name)
-
-    gt_pcd_path = gt_dir / "gt_pcd.npy"
     metrics_path = eval_dir / "metrics.json"
 
     if metrics_path.exists() and not force:
@@ -53,110 +56,33 @@ def evaluate(
 
     print(f"Evaluating: {object_name}/{method_name}")
 
-    if not gt_pcd_path.exists():
-        raise FileNotFoundError(f"GT point cloud not found: {gt_pcd_path}")
-    if not cleaned_mesh_path.exists():
-        raise FileNotFoundError(f"Cleaned mesh not found: {cleaned_mesh_path}")
+    # Stage 1: distances, at full length.
+    cell = compute_cell_distances(config, object_name, method_name, seed)
 
-    gt_pcd = np.load(gt_pcd_path)
-    print(f"  Loaded GT point cloud: {len(gt_pcd)} points")
-
-    data_mesh = load_mesh(cleaned_mesh_path)
-    print(f"  Loaded cleaned mesh: {len(data_mesh.vertices)} vertices")
-
-    if len(data_mesh.vertices) == 0 or len(data_mesh.faces) == 0:
-        # Empty reconstruction (failed method) -> failure cell. Skip NearestNeighbors,
-        # which cannot fit 0 points; build degenerate distances directly so compute_metrics
-        # yields NaN (its documented empty-set contract), keeping this out of means/rankings.
+    if cell.empty:
+        # Failure cell: NaN metrics (the empty-set contract of compute_metrics), kept out of means and rankings.
         print("  Empty cleaned mesh -> recording failure metrics (NaN)")
-        dist_data2gt = np.empty(0, dtype=np.float32)
-        dist_gt2data = np.full(len(gt_pcd), np.inf, dtype=np.float32)
-        metrics = compute_metrics(
-            dist_data2gt, dist_gt2data,
-            config.evaluation.fscore_thresholds, config.evaluation.max_dist,
+        metrics = build_metrics(
+            config, cell.data2gt_dist, cell.gt2data_dist,
+            applied_masks=[], n_gt_points=len(cell.gt_points), n_data_points=0, seed=seed, empty_mesh=True,
         )
-        metrics["seed"] = seed
-        metrics["n_gt_points"] = len(gt_pcd)
-        metrics["n_data_points"] = 0
-        metrics["exclude_masks"] = []
-        metrics["max_dist"] = config.evaluation.max_dist
-        metrics["empty_reconstruction"] = True
-        eval_dir.mkdir(parents=True, exist_ok=True)
-        curves_dir = eval_dir / "curves"
-        curves_dir.mkdir(exist_ok=True)
-        np.save(curves_dir / "thresholds.npy", np.array(metrics["thresholds"]))
-        np.save(curves_dir / "precision.npy", np.array(metrics["precision"]))
-        np.save(curves_dir / "recall.npy", np.array(metrics["recall"]))
-        np.save(curves_dir / "fscore.npy", np.array(metrics["fscore"]))
-        with open(metrics_path, "w") as f:
-            json.dump(metrics, f, indent=2)
+        write_metrics(eval_dir, metrics, cell.data2gt_dist, cell.gt2data_dist, fresh=True)
         print("  Chamfer: nan (empty reconstruction, scored as failure)")
         return metrics
 
-    density = config.evaluation.downsample_density
-
-    print(f"  Upsampling data mesh (density={density})")
-    data_pcd = upsample_mesh(data_mesh.vertices, data_mesh.faces, density)
-    print(f"  Upsampled to {len(data_pcd)} points")
-
-    # Numerical hygiene only: drop NaN points. No relative height cut is
-    # applied any more, so reconstructed points below the GT floor (bases,
-    # tables, ...) are kept and count in the distance/F-score metrics.
-    data_pcd = remove_nan_points(data_pcd)
-    print(f"  After NaN removal: {len(data_pcd)} points")
-
-    print("  Downsampling data point cloud")
-    data_down = downsample_pcd(data_pcd, density, shuffle=True, seed=seed)
-    print(f"  Downsampled to {len(data_down)} points")
-
-    print("  Computing distances")
-    dist_data2gt, idx_data2gt = compute_distances(data_down, gt_pcd)
-    dist_gt2data, idx_gt2data = compute_distances(gt_pcd, data_down)
-
-    # Apply GT exclusion mask(s). Shared with recompute/curves via core.masking so the
-    # three code paths can no longer diverge; `metrics["exclude_masks"]` below records
-    # exactly which files were used.
-    exclude, applied_masks = load_gt_exclude(
-        gt_dir, n_gt=len(gt_pcd), extra_exclude=extra_exclude
-    )
-    dist_data2gt_filtered, dist_gt2data_filtered = apply_exclude(
-        dist_data2gt, dist_gt2data, idx_data2gt, exclude
-    )
+    # Stage 2: metrics, under the GT exclusion masks. Nothing is written before the metrics are computed, so a
+    # mask that cannot be applied leaves the cell untouched.
+    exclude, applied_masks = load_gt_exclude(gt_dir, n_gt=len(cell.gt_points), extra_exclude=extra_exclude)
+    dist_data2gt, dist_gt2data = apply_exclude(cell.data2gt_dist, cell.gt2data_dist, cell.data2gt_idx, exclude)
 
     print("  Computing metrics")
-    metrics = compute_metrics(
-        dist_data2gt_filtered,
-        dist_gt2data_filtered,
-        config.evaluation.fscore_thresholds,
-        config.evaluation.max_dist,
+    metrics = build_metrics(
+        config, dist_data2gt, dist_gt2data,
+        applied_masks=applied_masks, n_gt_points=len(cell.gt_points), n_data_points=len(cell.data_points), seed=seed,
     )
-    mark_failure_if_no_data_kept(metrics, len(dist_data2gt_filtered))
-    metrics["seed"] = seed
-    metrics["n_gt_points"] = len(gt_pcd)
-    metrics["n_data_points"] = len(data_down)
-    metrics["exclude_masks"] = [Path(p).name for p in applied_masks]
-    metrics["max_dist"] = config.evaluation.max_dist
 
-    eval_dir.mkdir(parents=True, exist_ok=True)
-    distances_dir = eval_dir / "distances"
-    curves_dir = eval_dir / "curves"
-    distances_dir.mkdir(exist_ok=True)
-    curves_dir.mkdir(exist_ok=True)
-
-    np.save(distances_dir / "gt2data_dist.npy", dist_gt2data)
-    np.save(distances_dir / "gt2data_idx.npy", idx_gt2data)
-    np.save(distances_dir / "data2gt_dist.npy", dist_data2gt)
-    np.save(distances_dir / "data2gt_idx.npy", idx_data2gt)
-    np.save(distances_dir / "gt_points.npy", gt_pcd)
-    np.save(distances_dir / "data_points.npy", data_down)
-
-    np.save(curves_dir / "thresholds.npy", np.array(metrics["thresholds"]))
-    np.save(curves_dir / "precision.npy", np.array(metrics["precision"]))
-    np.save(curves_dir / "recall.npy", np.array(metrics["recall"]))
-    np.save(curves_dir / "fscore.npy", np.array(metrics["fscore"]))
-
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
+    save_cell_distances(eval_dir, cell)
+    write_metrics(eval_dir, metrics, dist_data2gt, dist_gt2data, fresh=True)
 
     print(f"  Chamfer: {metrics['chamfer']:.4f}")
     # Find closest threshold to 1.0 for display
@@ -164,7 +90,6 @@ def evaluate(
     if 1.0 in thresholds:
         fscore_1 = metrics["fscore"][thresholds.index(1.0)]
     else:
-        # Find closest threshold
         closest_idx = min(range(len(thresholds)), key=lambda i: abs(thresholds[i] - 1.0))
         fscore_1 = metrics["fscore"][closest_idx]
     print(f"  F-score@1.0: {fscore_1:.4f}")

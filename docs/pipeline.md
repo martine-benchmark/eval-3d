@@ -18,18 +18,29 @@ eval-pipeline -c $CFG preprocess-gt --clean-gt
 #    Reads results_raw/mesh.ply, writes results_cleaned/mesh.ply.
 eval-pipeline -c $CFG cleanup
 
-# 3. Distances, Chamfer, F-score at the reporting thresholds.
-#    Writes eval_results/metrics.json and eval_results/distances/.
+# 3. Evaluation, in two stages:
+#    distances: sample the mesh, nearest-neighbour search both ways. Writes eval_results/distances/.
+#    metrics:   exclusion masks, Chamfer, F-score at the reporting thresholds.
+#               Writes eval_results/metrics.json and eval_results/curves/.
 eval-pipeline -c $CFG evaluate
 
 # 4. Dense PR curves from the saved distances (no re-query).
 #    Writes eval_results/curves/.
 eval-pipeline -c $CFG curves -n 100
 
-# Optional: rebuild metrics.json + curves from saved distances, e.g. after changing
-# max_dist or adding a mask. Never re-runs the nearest-neighbour search.
-eval-pipeline -c $CFG recompute
 ```
+
+Each stage of `evaluate` also runs alone:
+
+```bash
+eval-pipeline -c $CFG distances   # stage 1 only: eval_results/distances/
+eval-pipeline -c $CFG metrics     # stage 2 only, from the saved distances
+```
+
+`metrics` is the stage to run again after changing `max_dist`, the thresholds or a mask: it reads
+`distances/*.npy`, never runs the nearest-neighbour search, and takes seconds per cell. Run alone, it keeps
+the keys other stages added to `metrics.json` and a dense threshold grid written by `curves`. It skips a
+cell whose distances were measured against a GT that changed since: that cell needs `distances -f`.
 
 Scope any stage with `-o/--object` and `-m/--method`; re-run with `-f/--force`.
 
@@ -124,6 +135,6 @@ eval-pipeline -c cfg.yaml $V cleanup -o rock -m my_method    # steps 1 and 2
 eval-pipeline -c cfg.yaml $V evaluate -o rock -m my_method   # step 4
 ```
 
-`apply-masks`, `curves`, `recompute`, `visualize` and `watch` then read and write the tagged
+`apply-masks`, `curves`, `distances`, `metrics`, `visualize` and `watch` then read and write the tagged
 directories. `aggregate`, `latex`, `figures`, `proxy-curvature` and `preprocess-challenges` refuse
 `--views`. The config keys are `paths.views` and `variant`.
