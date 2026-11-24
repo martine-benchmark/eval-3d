@@ -224,3 +224,36 @@ def test_render_support_matches_the_ray_cast_normal_map():
     assert rays.sum() > 1000
     iou = (drawn & rays).sum() / (drawn | rays).sum()
     assert iou > 0.99
+
+
+# Pixel convention: pyrender samples pixel (r, c) at (c + 0.5, r + 0.5); the cameras give the image position of each
+# pixel centre (c + pixel_centre, 0 for AliceVision). The renders must use the same pixel grid as the ray-cast maps.
+
+def test_pyrender_intrinsics_shift_the_principal_point():
+    from eval3d.core.rendering import pyrender_intrinsics
+
+    K = np.array([[10, 0, 50, 0], [0, 10, 40, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float64)
+    Kp = pyrender_intrinsics(K, pixel_centre=0.0)
+    assert (Kp[0, 2], Kp[1, 2]) == (50.5, 40.5)
+    assert (Kp[0, 0], Kp[1, 1]) == (10, 10)
+    np.testing.assert_array_equal(pyrender_intrinsics(K, pixel_centre=0.5), K)
+
+
+@pytest.mark.gl
+@pytest.mark.parametrize("pixel_centre", [0.0, 0.5])
+def test_render_and_rays_cover_the_same_pixels_of_a_thin_bar(pixel_centre):
+    """Bar 2 px wide with edges between pixel centres: half a pixel off would shift it by a whole column."""
+    from eval3d.core.normals import render_normal_map
+    from eval3d.core.rendering import OffscreenRenderer, pyrender_intrinsics
+
+    x0, x1 = 0.25 + pixel_centre, 2.25 + pixel_centre  # image x = X + cx with f = z = 10
+    v = np.array([[x0, -20, 10], [x1, -20, 10], [x1, 20, 10], [x0, 20, 10]], dtype=np.float64)
+    bar = trimesh.Trimesh(vertices=v, faces=[[0, 2, 1], [0, 3, 2]], process=False)
+    bar.visual.vertex_colors = np.tile(np.array([68, 1, 84, 255], dtype=np.uint8), (4, 1))
+    K = np.array([[10, 0, 5, 0], [0, 10, 5, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float64)
+    rays = render_normal_map(bar, K, np.eye(4), (10, 12), pixel_centre=pixel_centre).mask
+    with OffscreenRenderer(12, 10, pyrender_intrinsics(K, pixel_centre)) as renderer:
+        image = renderer.render_mesh(bar, np.eye(4, dtype=np.float32), lighting_mode="colored")
+    drawn = np.any(image != 255, axis=-1)
+    assert np.where(rays.any(axis=0))[0].tolist() == [6, 7]
+    np.testing.assert_array_equal(drawn, rays)

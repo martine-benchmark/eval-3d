@@ -12,6 +12,9 @@ from matplotlib.figure import Figure
 from PIL import Image
 from tqdm import tqdm
 
+from .camera import PIXEL_CENTRE_TRUNCATE
+from .normals import scale_intrinsics
+
 # Must be set before pyrender (hence PyOpenGL) is imported below.
 os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 
@@ -47,6 +50,18 @@ def check_pyrender():
             f"pyrender required for visualization ({PYRENDER_IMPORT_ERROR}). "
             "Install with: uv pip install -e '.[visualization]'"
         )
+
+
+def pyrender_intrinsics(K: np.ndarray, pixel_centre: float) -> np.ndarray:
+    """Intrinsics to give pyrender so that its pixel (r, c) samples the image at (c + pixel_centre, r + pixel_centre).
+
+    pyrender (OpenGL) samples each pixel at its centre c + 0.5 in its own image coordinates: the principal point is
+    moved by 0.5 - pixel_centre (0.5 for AliceVision cameras, whose top-left pixel centre is at (0, 0)).
+    """
+    Kp = np.array(K, dtype=np.float64, copy=True)
+    Kp[0, 2] += 0.5 - pixel_centre
+    Kp[1, 2] += 0.5 - pixel_centre
+    return Kp
 
 
 def _reversed_winding(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -433,11 +448,10 @@ def render_views(
         print(f"  Render resolution: {width}x{height} (from cx*2/cy*2, scale={scale})")
 
     # Scale intrinsics
-    K_scaled = K_ref.copy()
-    K_scaled[0, 0] *= scale  # fx
-    K_scaled[1, 1] *= scale  # fy
-    K_scaled[0, 2] *= scale  # cx
-    K_scaled[1, 2] *= scale  # cy
+    # Same pixel grid as the ray-cast normal maps: intrinsics scaled in the cameras' pixel-centre convention, then
+    # shifted to pyrender's sampling at the pixel centre + 0.5
+    pixel_centre = cameras.get("pixel_centre", PIXEL_CENTRE_TRUNCATE)
+    K_scaled = pyrender_intrinsics(scale_intrinsics(K_ref, scale, pixel_centre), pixel_centre)
 
     # Compute znear/zfar from mesh bounds and camera positions
     mesh_center = mesh.centroid
