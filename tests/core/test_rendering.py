@@ -12,7 +12,7 @@ def test_offscreen_renderer_basic():
     from eval3d.core.rendering import OffscreenRenderer
 
     # Create simple triangle, wound to FACE the camera (normal -Z, toward an OpenCV camera at
-    # the origin looking +Z): pyrender culls back faces, so [0, 1, 2] rendered nothing.
+    # the origin looking +Z).
     vertices = np.array([[0, 0, 1], [1, 0, 1], [0.5, 1, 1]], dtype=np.float32)
     faces = np.array([[0, 2, 1]])
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
@@ -142,3 +142,85 @@ def test_uniform_render_is_still_shaded():
         image = renderer.render_mesh(_tilted_square((200, 200, 200)), np.eye(4, dtype=np.float32), lighting_mode="uniform")
     drawn = image[np.any(image != 255, axis=-1)]
     assert len(drawn) > 1000 and np.abs(drawn.astype(int) - 200).max() > 5
+
+
+# Back faces: the renders show the z-buffer surface (what the normal maps ray cast), a face seen from behind included;
+# only its shading uses the flipped normal.
+
+def _flipped(mesh):
+    """Same surface, opposite winding: every face now turns its back to the camera."""
+    out = mesh.copy()
+    out.faces = out.faces[:, ::-1]
+    return out
+
+
+@pytest.mark.gl
+def test_colored_render_draws_back_faces_with_their_colors():
+    from eval3d.core.rendering import OffscreenRenderer
+
+    color = (68, 1, 84)
+    with OffscreenRenderer(640, 480, _K) as renderer:
+        image = renderer.render_mesh(_flipped(_tilted_square(color)), np.eye(4, dtype=np.float32), lighting_mode="colored")
+    drawn = image[np.any(image != 255, axis=-1)]
+    assert len(drawn) > 1000
+    assert np.abs(drawn.astype(int) - color).max() <= 1
+
+
+@pytest.mark.gl
+def test_uniform_render_shades_a_back_face_as_its_front():
+    """A face seen from behind is lit with its normal flipped: same image as the same face wound towards the camera."""
+    from eval3d.core.rendering import OffscreenRenderer
+
+    sq = _tilted_square((200, 200, 200))
+    with OffscreenRenderer(640, 480, _K) as renderer:
+        front = renderer.render_mesh(sq, np.eye(4, dtype=np.float32), lighting_mode="uniform")
+        back = renderer.render_mesh(_flipped(sq), np.eye(4, dtype=np.float32), lighting_mode="uniform")
+    assert np.any(front != 255)
+    assert np.abs(front.astype(int) - back.astype(int)).max() <= 1
+
+
+def _plane(z, half, color, towards_camera):
+    v = np.array([[-half, -half, z], [half, -half, z], [half, half, z], [-half, half, z]], dtype=np.float32)
+    f = np.array([[0, 2, 1], [0, 3, 2]]) if towards_camera else np.array([[0, 1, 2], [0, 2, 3]])
+    m = trimesh.Trimesh(vertices=v, faces=f, process=False)
+    m.visual.vertex_colors = np.tile(np.array([*color, 255], dtype=np.uint8), (4, 1))
+    return m
+
+
+@pytest.mark.gl
+@pytest.mark.parametrize("lighting_mode", ["colored", "uniform"])
+def test_a_nearer_back_face_hides_what_is_behind_it(lighting_mode):
+    """z-buffer, not culling: a back face in front of a front face is the visible surface."""
+    from eval3d.core.rendering import OffscreenRenderer
+
+    near_back = _plane(3.0, 0.5, (255, 0, 0), towards_camera=False)
+    far_front = _plane(6.0, 3.0, (0, 0, 255), towards_camera=True)
+    scene = trimesh.util.concatenate([near_back, far_front])
+    with OffscreenRenderer(640, 480, _K) as renderer:
+        image = renderer.render_mesh(scene, np.eye(4, dtype=np.float32), lighting_mode=lighting_mode)
+    centre = image[240, 320].astype(int)
+    assert centre[0] > centre[2], f"centre pixel {centre}: the far plane shows through the near back face"
+
+
+@pytest.mark.gl
+def test_render_support_matches_the_ray_cast_normal_map():
+    """Open inside-out cap (near half of a sphere, faces wound away): the render covers the pixels the normal map ray
+    casts. A closed inside-out sphere would not test anything, its far half facing the camera."""
+    from eval3d.core.normals import render_normal_map
+    from eval3d.core.rendering import OffscreenRenderer
+
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+    sphere.apply_translation([0.1, -0.2, 5.0])
+    sphere = _flipped(sphere)
+    sphere.update_faces(sphere.triangles_center[:, 2] < 5.0)
+    sphere.remove_unreferenced_vertices()
+    sphere.visual.vertex_colors = np.tile(np.array([68, 1, 84, 255], dtype=np.uint8), (len(sphere.vertices), 1))
+    K = np.array([[200, 0, 64, 0], [0, 200, 48, 0], [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float64)
+    with OffscreenRenderer(128, 96, K) as renderer:
+        image = renderer.render_mesh(sphere, np.eye(4, dtype=np.float32), lighting_mode="colored")
+    drawn = np.any(image != 255, axis=-1)
+    # pyrender samples pixel (r, c) at (c + 0.5, r + 0.5): same rays as pixel_centre=0.5
+    rays = render_normal_map(sphere, K, np.eye(4), (96, 128), pixel_centre=0.5).mask
+    assert rays.sum() > 1000
+    iou = (drawn & rays).sum() / (drawn | rays).sum()
+    assert iou > 0.99

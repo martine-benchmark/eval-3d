@@ -49,6 +49,21 @@ def check_pyrender():
         )
 
 
+def _two_sided(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """The mesh plus a copy of it with the opposite winding (colors kept).
+
+    Rendered with back-face culling, each pixel shows its nearest face: a face seen from the front is drawn by the
+    original, a face seen from behind by its copy, whose normal is the flipped one.
+    """
+    v, f = np.asarray(mesh.vertices), np.asarray(mesh.faces)
+    out = trimesh.Trimesh(vertices=np.vstack([v, v]), faces=np.vstack([f, f[:, ::-1] + len(v)]), process=False)
+    if mesh.visual.kind == "vertex":
+        out.visual.vertex_colors = np.vstack([mesh.visual.vertex_colors] * 2)
+    elif mesh.visual.kind == "face":
+        out.visual.face_colors = np.vstack([mesh.visual.face_colors] * 2)
+    return out
+
+
 class OffscreenRenderer:
     """Pyrender-based offscreen mesh renderer."""
 
@@ -113,7 +128,11 @@ class OffscreenRenderer:
                 ambient_light=[0.6, 0.6, 0.6],
             )
 
-        # Convert trimesh to pyrender mesh - preserve vertex colors
+        # Convert trimesh to pyrender mesh - preserve vertex colors. Every face is drawn, seen from the front or from
+        # behind: the visible surface is the z-buffer one, as in the ray-cast normal maps. A shaded render draws a back
+        # face through a copy of opposite winding, i.e. lit with its normal flipped (display only).
+        if lighting_mode == "uniform":
+            mesh = _two_sided(mesh)
         pyrender_mesh = pyrender.Mesh.from_trimesh(mesh, smooth=False)
         scene.add(pyrender_mesh)
 
@@ -142,7 +161,9 @@ class OffscreenRenderer:
 
         # Render. A colored mesh carries a colormap read against its colorbar: it is drawn flat (vertex colors as
         # they are, no shading), otherwise the lighting changes every color with the surface orientation.
-        flags = pyrender.RenderFlags.NONE if lighting_mode == "uniform" else pyrender.RenderFlags.FLAT
+        # The uniform render keeps back-face culling: its two-sided copy draws each face once, from the side it is seen.
+        flags = (pyrender.RenderFlags.NONE if lighting_mode == "uniform"
+                 else pyrender.RenderFlags.FLAT | pyrender.RenderFlags.SKIP_CULL_FACES)
         color, _ = self.renderer.render(scene, flags=flags)
 
         return color

@@ -183,3 +183,42 @@ def test_angular_error_is_exact_at_small_angles():
     b = np.array([np.sin(th), 0.0, np.cos(th)], dtype=np.float32)
     assert angular_error_deg(a, b) == pytest.approx(1e-3, rel=1e-2)
     assert angular_error_deg(a, a) == 0.0
+
+
+# A face seen from behind (z-buffer surface whose winding turns away from the camera) is compared with its normal
+# flipped, for the GT and the reconstruction alike (Baptiste, 24/11).
+
+def _away(mesh):
+    out = mesh.copy()
+    out.faces = out.faces[:, ::-1]
+    return out
+
+
+def test_back_face_normal_is_flipped_towards_the_camera():
+    r = render_normal_map(_away(_plane()), _K(), np.eye(4), (10, 10))
+    assert r.mask.all() and r.back_face.all()
+    np.testing.assert_allclose(r.normals[r.mask], [[0.0, 0.0, 1.0]] * 100, atol=1e-6)
+
+
+def test_front_face_is_not_a_back_face():
+    r = render_normal_map(_plane(), _K(), np.eye(4), (10, 10))
+    assert not r.back_face.any()
+
+
+def test_flip_can_be_turned_off():
+    r = render_normal_map(_away(_plane()), _K(), np.eye(4), (10, 10), flip_back_faces=False)
+    np.testing.assert_allclose(r.normals[r.mask], [[0.0, 0.0, -1.0]] * 100, atol=1e-6)
+
+
+def test_inside_out_surface_has_the_same_normal_map():
+    """Open cap wound either way: same visible surface, same compared normals (zero angular error)."""
+    sphere = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+    sphere.apply_translation([0.0, 0.0, 5.0])
+    sphere.update_faces(sphere.triangles_center[:, 2] < 5.0)
+    sphere.remove_unreferenced_vertices()
+    K = _K(f=200.0, cx=50.0, cy=50.0)
+    a = render_normal_map(sphere, K, np.eye(4), (100, 100))
+    b = render_normal_map(_away(sphere), K, np.eye(4), (100, 100))
+    np.testing.assert_array_equal(a.mask, b.mask)
+    assert b.back_face[b.mask].all() and not a.back_face.any()
+    assert angular_error_deg(a.normals[a.mask], b.normals[b.mask]).max() < 1e-3

@@ -636,8 +636,9 @@ def visualize_normals(
         cat = pixel_categories(g.mask, r.mask, excluded)
         stats = normal_error_stats(err, cat, g.mask, excluded)
         valid = cat["valid"]
-        stats["gt_back_facing"] = float((g.facing[valid] < 0).mean()) if valid.any() else float("nan")
-        stats["method_back_facing"] = float((r.facing[valid] < 0).mean()) if valid.any() else float("nan")
+        # Fraction of the counted pixels seen on a back face (their normal is compared flipped)
+        stats["gt_back_facing"] = float(g.back_face[valid].mean()) if valid.any() else float("nan")
+        stats["method_back_facing"] = float(r.back_face[valid].mean()) if valid.any() else float("nan")
         stats["window"] = [int(x) for x in (bbox if bbox is not None else (0, H - 1, 0, W - 1))]
         stats["time_s"] = round(time.perf_counter() - t0, 2)
         per_view[str(idx)] = stats
@@ -670,7 +671,8 @@ def visualize_normals(
         summary = {
             **(info or {}),
             "definition": "per-pixel angle between the ray-cast GT and method normal maps (interpolated vertex "
-                          "normals), over the pixels seen by both meshes and not excluded",
+                          "normals, flipped on faces seen from behind), over the pixels seen by both meshes and not "
+                          "excluded",
             "vmax_deg": ANGULAR_ERROR_MAX_DEG,
             "scale": scale,
             "pixel_centre": pixel_centre,
