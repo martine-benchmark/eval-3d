@@ -32,12 +32,13 @@ _CV_TO_GL = np.array([1.0, -1.0, -1.0])
 class NormalRender:
     """One ray-cast view. All arrays are (h, w[, 3]) over the rendered window (full image or bbox)."""
 
-    normals: np.ndarray  # float32, unit camera-frame OpenGL normals, 0 where no hit
+    normals: np.ndarray  # float32, unit camera-frame OpenGL normals, 0 where no hit; flipped on back faces (see render)
     mask: np.ndarray  # bool, ray hit the mesh
     points: np.ndarray  # float32 world hit points, NaN where no hit
     face_index: np.ndarray  # int32 hit face, -1 where no hit
     nearest_vertex: np.ndarray  # int32 vertex of the hit face closest to the hit (max barycentric), -1
-    facing: np.ndarray  # float32 cos(normal, direction to the camera); < 0 = back-facing normal
+    facing: np.ndarray  # float32 cos(interpolated mesh normal, direction to the camera), before any flip
+    back_face: np.ndarray  # bool, the hit face is seen from behind (its winding turns away from the camera)
 
 
 def scale_intrinsics(K: np.ndarray, scale: float, pixel_centre: float = 0.0) -> np.ndarray:
@@ -71,6 +72,7 @@ class NormalRenderer:
         self.faces = np.asarray(mesh.faces, dtype=np.int64)
         self.vertices = np.asarray(mesh.vertices, dtype=np.float64)
         self.vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float64)
+        self.face_normals = np.asarray(mesh.face_normals, dtype=np.float64)
         self.chunk_size = chunk_size
         self._rmi = _intersector(mesh)
 
@@ -81,7 +83,13 @@ class NormalRenderer:
         shape: tuple[int, int],
         pixel_centre: float = 0.0,
         bbox: tuple[int, int, int, int] | None = None,
+        flip_back_faces: bool = True,
     ) -> NormalRender:
+        """Normal map of the z-buffer surface (first hit of each pixel ray).
+
+        With ``flip_back_faces``, a pixel whose hit face is seen from behind gets the flipped normal: the visible side
+        of the surface is compared, whatever the winding of the mesh (as the renders draw it).
+        """
         H, W = shape
         rmin, rmax, cmin, cmax = bbox if bbox is not None else (0, H - 1, 0, W - 1)
         h, w = rmax - rmin + 1, cmax - cmin + 1
@@ -95,6 +103,7 @@ class NormalRenderer:
         face_index = np.full(h * w, -1, dtype=np.int32)
         nearest_vertex = np.full(h * w, -1, dtype=np.int32)
         facing = np.zeros(h * w, dtype=np.float32)
+        back_face = np.zeros(h * w, dtype=bool)
 
         xs = (np.arange(cmin, cmax + 1) + pixel_centre - cx) / fx
         ys = (np.arange(rmin, rmax + 1) + pixel_centre - cy) / fy
@@ -116,11 +125,15 @@ class NormalRenderer:
             n_w = np.einsum("nk,nkd->nd", bary, self.vertex_normals[corners])
             n_w /= np.maximum(np.linalg.norm(n_w, axis=1, keepdims=True), 1e-12)
             pix = ids[ray]
+            facing[pix] = -np.einsum("nd,nd->n", n_w, d_world[ray])
+            back = np.einsum("nd,nd->n", self.face_normals[tri], d_world[ray]) > 0
+            back_face[pix] = back
+            if flip_back_faces:
+                n_w[back] *= -1.0
             normals[pix] = (n_w @ R.T) * _CV_TO_GL
             points[pix] = loc
             face_index[pix] = tri
             nearest_vertex[pix] = corners[np.arange(len(tri)), np.argmax(bary, axis=1)]
-            facing[pix] = -np.einsum("nd,nd->n", n_w, d_world[ray])
 
         return NormalRender(
             normals=normals.reshape(h, w, 3),
@@ -129,6 +142,7 @@ class NormalRenderer:
             face_index=face_index.reshape(h, w),
             nearest_vertex=nearest_vertex.reshape(h, w),
             facing=facing.reshape(h, w),
+            back_face=back_face.reshape(h, w),
         )
 
 
@@ -139,13 +153,15 @@ def render_normal_map(
     shape: tuple[int, int],
     pixel_centre: float = 0.0,
     bbox: tuple[int, int, int, int] | None = None,
+    flip_back_faces: bool = True,
 ) -> NormalRender:
     """Ray-cast the normal map of ``mesh`` seen by camera (K, Rt world->camera) on an (H, W) grid.
 
     ``bbox`` = (rmin, rmax, cmin, cmax), inclusive as ``rendering.crop_to_bbox``: only those pixels
     are cast and returned.
     """
-    return NormalRenderer(mesh).render(K, Rt, shape, pixel_centre=pixel_centre, bbox=bbox)
+    return NormalRenderer(mesh).render(K, Rt, shape, pixel_centre=pixel_centre, bbox=bbox,
+                                       flip_back_faces=flip_back_faces)
 
 
 def angular_error_deg(a: np.ndarray, b: np.ndarray) -> np.ndarray:

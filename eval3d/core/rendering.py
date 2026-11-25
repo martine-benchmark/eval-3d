@@ -12,6 +12,9 @@ from matplotlib.figure import Figure
 from PIL import Image
 from tqdm import tqdm
 
+from .camera import PIXEL_CENTRE_TRUNCATE
+from .normals import scale_intrinsics
+
 # Must be set before pyrender (hence PyOpenGL) is imported below.
 os.environ.setdefault("PYOPENGL_PLATFORM", "osmesa")
 
@@ -47,6 +50,28 @@ def check_pyrender():
             f"pyrender required for visualization ({PYRENDER_IMPORT_ERROR}). "
             "Install with: uv pip install -e '.[visualization]'"
         )
+
+
+def pyrender_intrinsics(K: np.ndarray, pixel_centre: float) -> np.ndarray:
+    """Intrinsics to give pyrender so that its pixel (r, c) samples the image at (c + pixel_centre, r + pixel_centre).
+
+    pyrender (OpenGL) samples each pixel at its centre c + 0.5 in its own image coordinates: the principal point is
+    moved by 0.5 - pixel_centre (0.5 for AliceVision cameras, whose top-left pixel centre is at (0, 0)).
+    """
+    Kp = np.array(K, dtype=np.float64, copy=True)
+    Kp[0, 2] += 0.5 - pixel_centre
+    Kp[1, 2] += 0.5 - pixel_centre
+    return Kp
+
+
+def _reversed_winding(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    """Same surface and colors, opposite winding: its front faces are the original's back faces."""
+    out = trimesh.Trimesh(vertices=mesh.vertices, faces=np.asarray(mesh.faces)[:, ::-1], process=False)
+    if mesh.visual.kind == "vertex":
+        out.visual.vertex_colors = mesh.visual.vertex_colors
+    elif mesh.visual.kind == "face":
+        out.visual.face_colors = mesh.visual.face_colors
+    return out
 
 
 class OffscreenRenderer:
@@ -113,9 +138,9 @@ class OffscreenRenderer:
                 ambient_light=[0.6, 0.6, 0.6],
             )
 
-        # Convert trimesh to pyrender mesh - preserve vertex colors
-        pyrender_mesh = pyrender.Mesh.from_trimesh(mesh, smooth=False)
-        scene.add(pyrender_mesh)
+        # Convert trimesh to pyrender mesh - preserve vertex colors. Every face is drawn, seen from the front or from
+        # behind: the visible surface is the z-buffer one, as in the ray-cast normal maps.
+        mesh_node = scene.add(pyrender.Mesh.from_trimesh(mesh, smooth=False))
 
         # Camera pose: pyrender expects camera-to-world, but we have world-to-camera (Rt)
         # So we need to invert: pose = Rt^-1
@@ -141,11 +166,22 @@ class OffscreenRenderer:
         scene.add(light, pose=camera_pose)
 
         # Render. A colored mesh carries a colormap read against its colorbar: it is drawn flat (vertex colors as
-        # they are, no shading), otherwise the lighting changes every color with the surface orientation.
-        flags = pyrender.RenderFlags.NONE if lighting_mode == "uniform" else pyrender.RenderFlags.FLAT
-        color, _ = self.renderer.render(scene, flags=flags)
+        # they are, no shading), otherwise the lighting changes every color with the surface orientation. Back faces
+        # are not culled.
+        if lighting_mode != "uniform":
+            color, _ = self.renderer.render(scene, flags=pyrender.RenderFlags.FLAT | pyrender.RenderFlags.SKIP_CULL_FACES)
+            return color
 
-        return color
+        # Shaded render: a face seen from behind is lit with its normal flipped (display only). Two culled passes, the
+        # mesh then the same mesh with the opposite winding (whose front faces are the original's back faces, normals
+        # flipped), merged by depth. One pass at a time: a two-sided copy would double the GL buffers (OSMesa
+        # crashes beyond ~10 M faces).
+        front, depth_front = self.renderer.render(scene, flags=pyrender.RenderFlags.NONE)
+        scene.remove_node(mesh_node)
+        scene.add(pyrender.Mesh.from_trimesh(_reversed_winding(mesh), smooth=False))
+        back, depth_back = self.renderer.render(scene, flags=pyrender.RenderFlags.NONE)
+        use_back = (depth_back > 0) & ((depth_front == 0) | (depth_back < depth_front))
+        return np.where(use_back[..., None], back, front)
 
     def __enter__(self):
         return self
@@ -412,11 +448,10 @@ def render_views(
         print(f"  Render resolution: {width}x{height} (from cx*2/cy*2, scale={scale})")
 
     # Scale intrinsics
-    K_scaled = K_ref.copy()
-    K_scaled[0, 0] *= scale  # fx
-    K_scaled[1, 1] *= scale  # fy
-    K_scaled[0, 2] *= scale  # cx
-    K_scaled[1, 2] *= scale  # cy
+    # Same pixel grid as the ray-cast normal maps: intrinsics scaled in the cameras' pixel-centre convention, then
+    # shifted to pyrender's sampling at the pixel centre + 0.5
+    pixel_centre = cameras.get("pixel_centre", PIXEL_CENTRE_TRUNCATE)
+    K_scaled = pyrender_intrinsics(scale_intrinsics(K_ref, scale, pixel_centre), pixel_centre)
 
     # Compute znear/zfar from mesh bounds and camera positions
     mesh_center = mesh.centroid
